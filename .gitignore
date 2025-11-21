@@ -1,0 +1,3 @@
+.obsidian
+data/*
+!.gitkeep     # optional if you want to commit an empty folder
