@@ -31,6 +31,15 @@ from sklearn.metrics import classification_report, confusion_matrix
 ## GENERAL UTILITIES
 ## ====================
 
+def try_except_decorator(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return None
+    return wrapper
+
 def slice_signal(data, annotations, fs, slice_duration=1.0, overlap=0.5, annotation_threshold=0.25):
     slice_length = int(slice_duration * fs)
     step = int(slice_length * (1 - overlap))
@@ -48,29 +57,145 @@ def slice_signal(data, annotations, fs, slice_duration=1.0, overlap=0.5, annotat
 ## SIGNAL PROCESSING UTILITIES
 ## ====================
 
-def rw_normalization(x, window_size=17):
-    if window_size % 2 == 0:
-        window_size += 1  # make it odd
-    normalization_kernel = np.ones((window_size,)) / (window_size-1)
-    normalization_kernel[window_size // 2] = 0
-    smooth_x = signal.convolve(x, normalization_kernel, mode='same')
-    ret = x / (smooth_x + 1e-10)
+def get_spectrogram(data, 
+                    fs, 
+                    nperseg=65536,
+                    hop=None, 
+                    noverlap=None, 
+                    window='hann', 
+                    crop_freq=None):
 
-    # handle edge cases
-    ret[:window_size//2] = ret[window_size//2]
-    ret[-window_size//2:] = ret[-window_size//2-1]
-    return ret
+    if hop is None:
+        noverlap = nperseg // 8
+    else:
+        noverlap = int(nperseg * hop)
 
-def rw_normalization2d(x, window_size=17):
-    if window_size % 2 == 0:
-        window_size += 1  # make it odd
-    normalization_kernel = np.ones((window_size, window_size)) / (window_size**2 - 1)
-    normalization_kernel[window_size // 2, window_size // 2] = 0
-    smooth_x = signal.convolve2d(x, normalization_kernel, mode='same')
-    ret = x / (smooth_x + 1e-10)
-    return ret
+    # Compute spectrogram
+    frequencies, times, Sxx = signal.spectrogram(
+        data,
+        fs=fs,
+        window=window,
+        nperseg=nperseg,
+        noverlap=noverlap
+    )
 
-def calc_spectrogram(x, fs, nperseg, percent_overlap, window='hamming', remove_dc=None, crop_freq=None):
+    # Crop frequencies if specified
+    if crop_freq is not None:
+        freq_mask = frequencies <= crop_freq
+        frequencies = frequencies[freq_mask]
+        Sxx = Sxx[freq_mask, :]
+
+    # Convert to dB scale
+    Sxx_db = 10 * np.log10(Sxx + 1e-10)  # Add small value to avoid log(0)
+
+    return frequencies, times, Sxx_db
+
+def pwelch(data, fs, remove_dc=20, crop_freq=None, nperseg=None, normalization_window_size=101):
+    if nperseg is None:
+        nperseg = fs * 2
+
+    f, Pxx = welch(data, fs=fs, nperseg=nperseg)
+
+    if normalization_window_size is not None:
+        if normalization_window_size % 2 == 0:
+            normalization_window_size += 1  # make it odd
+        normalization_kernel = np.ones((normalization_window_size,)) / (normalization_window_size-1)
+        normalization_kernel[normalization_window_size // 2] = 0
+        smoothed_Pxx = signal.convolve(Pxx, normalization_kernel, mode='same')
+        Pxx = Pxx / (smoothed_Pxx + 1e-10)
+    if remove_dc is not None:
+        dc_band = f <= remove_dc
+        Pxx[dc_band] = 0
+    if crop_freq is not None:
+        crop_band = f <= crop_freq
+        f = f[crop_band]
+        Pxx = Pxx[crop_band]
+
+    return f, Pxx
+
+def pwelch_line_detection(data, fs, threshold=5, remove_dc=20, crop_freq=5000, nperseg=None, normalization_window_size=None):
+    f, Pxx = pwelch(data, fs, remove_dc=remove_dc, crop_freq=crop_freq, nperseg=nperseg, normalization_window_size=normalization_window_size)
+    threshold = np.mean(Pxx) + threshold * np.std(Pxx)
+    peaks, properties = find_peaks(Pxx, height=threshold)
+    detected_frequencies = f[peaks]
+    detected_powers = Pxx[peaks]
+    return detected_frequencies, detected_powers, f, Pxx
+
+def my_spec(x, fs, nperseg, noverlap, window, normalization_window_size=None, remove_dc=None, crop_freq=None, with_entropy=False):
+
+    # bandpass filter
+    if remove_dc is not None and crop_freq is not None:
+        b, a = butter(4, [remove_dc/(fs/2), crop_freq/(fs/2)], btype='band')
+        x = filtfilt(b, a, x)
+    elif remove_dc is not None:
+        b, a = butter(4, remove_dc/(fs/2), btype='high')
+        x = filtfilt(b, a, x)
+    elif crop_freq is not None:
+        b, a = butter(4, crop_freq/(fs/2), btype='low')
+        x = filtfilt(b, a, x)
+    
+    # prepare for PSD calculation
+    step = nperseg - noverlap
+    window_vals = getattr(np, window)(nperseg) if hasattr(np, window) else np.hamming(nperseg)
+    window_power = np.sum(window_vals**2)
+
+    n_segments = (len(x) - noverlap) // step
+    f = np.fft.rfftfreq(nperseg, 1/fs)
+    p_matrix = np.zeros((n_segments, len(f)))
+
+    for i in range(n_segments):
+        start = i * step
+        segment = x[start:start+nperseg]
+        if len(segment) < nperseg:
+            break
+        segment = segment * window_vals
+        spectrum = np.fft.rfft(segment)
+        p_matrix[i, :] = (np.abs(spectrum)**2) / (fs * window_power)
+
+    # Pxx = psd / n_segments
+    Pxx = np.mean(p_matrix, axis=0)
+    P_std = np.std(p_matrix, axis=0)
+    # if with_entropy:
+    #     P_entropy = entropy_of_frequencies(p_matrix.T)
+
+    # normalization
+    if normalization_window_size is not None:
+        if normalization_window_size % 2 == 0:
+            normalization_window_size += 1  # make it odd
+        normalization_kernel = np.ones((normalization_window_size,)) / (normalization_window_size-1)
+        normalization_kernel[normalization_window_size // 2] = 0
+
+        smoothed_Pxx = signal.convolve(Pxx, normalization_kernel, mode='same')
+        Pxx = Pxx / (smoothed_Pxx + 1e-10)
+        smoothed_P_std = signal.convolve(P_std, normalization_kernel, mode='same')
+        P_std = P_std / (smoothed_P_std + 1e-10)
+        # if with_entropy:
+        #     smoothed_P_entropy = signal.convolve(P_entropy, normalization_kernel, mode='same')
+        #     P_entropy = P_entropy / (smoothed_P_entropy + 1e-10)
+
+    # # remove DC and crop frequencies  # TODO: consider replacing with bandpass filter
+    # if remove_dc is not None:
+    #     dc_band = f >= remove_dc
+    #     f = f[dc_band]
+    #     Pxx = Pxx[dc_band]
+    #     P_std = P_std[dc_band]
+    #     if with_entropy:
+    #         P_entropy = P_entropy[dc_band]
+
+    # if crop_freq is not None:
+    #     crop_band = f <= crop_freq
+    #     f = f[crop_band]
+    #     Pxx = Pxx[crop_band]
+    #     P_std = P_std[crop_band]
+    #     if with_entropy:
+    #         P_entropy = P_entropy[crop_band]
+
+    # prepare output
+    # ans = (f, Pxx, P_std, P_entropy) if with_entropy else (f, Pxx, P_std)
+
+    return f, Pxx, P_std, p_matrix
+
+def running_window_spectrogram(x, fs, nperseg, percent_overlap, window='hamming', remove_dc=None, crop_freq=None):
 
     # bandpass filter
     if remove_dc is not None and crop_freq is not None:
@@ -113,25 +238,84 @@ def calc_spectrogram(x, fs, nperseg, percent_overlap, window='hamming', remove_d
 
     return f, t, Sxx, Phase
 
-def calc_welch_from_spectrogram(Sxx, normalization_window_size=None):
-    Pxx = np.mean(Sxx, axis=0)
+def welch_from_pmatrix(p_matrix, normalization_window_size=101):
+    Pxx = np.mean(p_matrix, axis=0)
     if normalization_window_size is not None:
         Pxx = rw_normalization(Pxx, window_size=normalization_window_size)
     return Pxx
 
-def calc_std_from_spectrogram(Sxx, normalization_window_size=None):
-    P_std = np.std(Sxx, axis=0)
+def std_from_pmatrix(p_matrix, normalization_window_size=101):
+    P_std = np.std(p_matrix, axis=0)
     if normalization_window_size is not None:
-        P_std = rw_normalization(P_std, window_size=normalization_window_size)
+        if normalization_window_size % 2 == 0:
+            normalization_window_size += 1  # make it odd
+        normalization_kernel = np.ones((normalization_window_size,)) / (normalization_window_size-1)
+        normalization_kernel[normalization_window_size // 2] = 0
+        smoothed_P_std = signal.convolve(P_std, normalization_kernel, mode='same')
+        P_std = P_std / (smoothed_P_std + 1e-100)
     return P_std
 
-def calc_avg_diff_from_spectrogram(Sxx, normalization_window_size=None):
-    avg_diff = np.log(np.average(np.abs(np.diff(Sxx, axis=0)), axis=0))
+def avg_diff_from_pmatrix(p_matrix, normalization_window_size=101):
+    avg_diff = np.log(np.average(np.abs(np.diff(p_matrix, axis=0)), axis=0))
     if normalization_window_size is not None:
-            avg_diff = rw_normalization(avg_diff, window_size=normalization_window_size)
+            if normalization_window_size % 2 == 0:
+                normalization_window_size += 1  # make it odd
+            normalization_kernel = np.ones((normalization_window_size,)) / (normalization_window_size-1)
+            normalization_kernel[normalization_window_size // 2] = 0
+            smooth_avg_diff = signal.convolve(avg_diff, normalization_kernel, mode='same')
+            avg_diff = avg_diff / (smooth_avg_diff + 1e-10)
     return avg_diff
 
-def calc_rw_symmetry(pxx, window_size):
+def detect_frequencies(x, fs, nperseg, remove_dc, crop_freq, normalization_window_size, threshold):
+    f, pxx, std, p_matrix = ut.my_spec(x, fs=fs, nperseg=nperseg, noverlap=nperseg//2, window='hamming', normalization_window_size=normalization_win, remove_dc=remove_dc, crop_freq=crop_freq)
+    pxx = pxx / np.percentile(pxx, 90)
+    pxx_peak_indices = find_peaks(pxx, height=(np.average(pxx) + np.std(pxx)*threshold))[0]
+    std_peak_indices = find_peaks(std, height=(np.average(std) + np.std(std)*threshold))[0]
+    peak_ixs = np.intersect1d(pxx_peak_indices, std_peak_indices)
+    detected_frequencies = f[peak_ixs]
+    return detected_frequencies, (f, pxx, std)
+
+def running_window_convolution(pxx, nperseg):
+    half_window = nperseg // 2
+    convolved = np.zeros_like(pxx)
+    for i in range(len(pxx)):
+        start_idx = max(0, i - half_window)
+        end_idx = min(len(pxx), i + half_window + 1)
+        segment = pxx[start_idx:end_idx]
+        convolved[i] = np.max(segment * np.flip(segment))
+    return convolved
+
+def rw_normalization(x, window_size=17):
+    if window_size % 2 == 0:
+        window_size += 1  # make it odd
+    normalization_kernel = np.ones((window_size,)) / (window_size-1)
+    normalization_kernel[window_size // 2] = 0
+    smooth_x = signal.convolve(x, normalization_kernel, mode='same')
+    ret = x / (smooth_x + 1e-10)
+
+    # handle edge cases
+    ret[:window_size//2] = ret[window_size//2]
+    ret[-window_size//2:] = ret[-window_size//2-1]
+    return ret
+
+def rw_normalization2d(x, window_size=17):
+    if window_size % 2 == 0:
+        window_size += 1  # make it odd
+    normalization_kernel = np.ones((window_size, window_size)) / (window_size**2 - 1)
+    normalization_kernel[window_size // 2, window_size // 2] = 0
+    smooth_x = signal.convolve2d(x, normalization_kernel, mode='same')
+    ret = x / (smooth_x + 1e-10)
+    return ret
+
+def symmetry_enhancement(pxx, normalization_win=101, nperseg=1024):
+    x = running_window_convolution(pxx, nperseg=nperseg)
+    x = rw_normalization(x, window_size=normalization_win)
+    x = x / (np.mean(x) + 1e-10)
+    # x = x[100:-100]
+    x = np.log(x)
+    return x
+
+def rw_symmetry(pxx, window_size):
     half = window_size // 2
     vals = np.zeros(pxx.shape[0])
     for i in range(pxx.shape[0]):
@@ -151,9 +335,18 @@ def calc_rw_symmetry(pxx, window_size):
             bw = bw[:minlen]
         
         vals[i] = np.convolve(fw, bw, mode='valid')[0]
+
+    #     # vals[i] = np.sum((fw - bw)**2)
+    #     vals[i] = np.sum(fw**2 - bw**2)
+    #     vals[i] = vals[i] / (np.sum(fw**2) + np.sum(bw**2) + 1e-10)
+    
+    # vals = np.diff(vals, n=1, prepend=0)
+    # vals = np.where(vals < 0, 0, vals)
+    # vals = np.abs(vals)
+    # vals = rw_normalization(vals)
     return vals
 
-def calc_rw_curvature(pxx, window_size):
+def rw_curvature(pxx, window_size):
     half = window_size // 2
     vals = np.zeros(pxx.shape[0])
     for i in range(pxx.shape[0]):
@@ -186,6 +379,94 @@ def calc_local_curvature(pxx, normalization_window_size=None):
     return curvature
 
 ## ====================
+## VISUALIZATION UTILITIES
+## ====================
+
+def plot_spectrogram(frequencies, 
+                     times, 
+                     Sxx_db, 
+                     colorscale='Viridis',
+                     title='Spectrogram',
+                     xlabel='Time [s]',
+                     ylabel='Frequency [Hz]',
+                     show=False,
+                     annotations=None):
+    
+    fig = px.imshow(
+        Sxx_db,
+        x=times,
+        y=frequencies,
+        aspect='auto',
+        origin='lower',
+        color_continuous_scale=colorscale,
+        labels={'x': 'Time [s]', 'y': 'Frequency [Hz]', 'color': 'Intensity [dB]'}
+    )
+
+    if annotations:
+        for annotation in annotations:
+            fig.add_shape(
+                type="rect",
+                x0=annotation['x0'],
+                y0=annotation['y0'],
+                x1=annotation['x1'],
+                y1=annotation['y1'],
+                line=dict(color='Yellow', width=2, dash='dash'),
+                label=dict(text=annotation['text'], font=dict(size=10, color='yellow'), textposition="top left")
+            )
+        
+    fig.update_layout(title=title, xaxis_title=xlabel, yaxis_title=ylabel)
+    if show:
+        fig.show()
+    return fig
+
+def plot_batch(slices, fs, slice_annotations, 
+               ixs=None, 
+               batch_size=4, 
+               crop_freq=None, 
+               remove_dc=20, 
+               nperseg=32768, 
+               show=False,
+               with_vis_graph=False):
+    if ixs is not None:
+        batch_size = len(ixs)
+    if ixs is None:
+        ixs = np.random.choice(len(slices), size=batch_size, replace=False)
+
+    _rows = 3 if with_vis_graph else 2
+    fig = make_subplots(rows=_rows, cols=batch_size)
+
+    for i, ix in enumerate(ixs):
+        s = slices[ix]
+        a = slice_annotations[ix]
+        
+        f, t, Sxx = get_spectrogram(s, fs, crop_freq=crop_freq, nperseg=nperseg)
+        fig.add_trace(go.Heatmap(z=Sxx, x=t, y=f, colorscale='Viridis', showscale=False), row=1, col=i+1)
+
+        f_pxx, Pxx = pwelch(s, fs, remove_dc=remove_dc, crop_freq=crop_freq)
+        fig.add_trace(go.Scatter(x=f_pxx, y=Pxx, mode='lines'), row=2, col=i+1)
+
+        if with_vis_graph:
+            vis_adjencency = calc_vis_graph(f_pxx, Pxx)
+            # show visibility adjacency as an image
+            dots = np.where(vis_adjencency == 1)
+            fig.add_trace(go.Scatter(x=dots[0], y=dots[1], mode='markers', marker=dict(size=0.5, color='black')), row=3, col=i+1)
+
+        fig.update_xaxes(title_text=f'Slice {ix} - Annotation: {a}', row=1, col=i+1)
+
+    if show:
+        fig.show()
+    return fig
+
+def plot_graph_from_matrix(M, show=False):
+    fig = go.Figure()
+    dots = np.where(M == 1)
+    fig.add_trace(go.Scatter(x=dots[0], y=dots[1], mode='markers', marker=dict(size=0.5, color='black')))
+    fig.update_layout(title='Visibility Graph', xaxis_title='Node Index', yaxis_title='Node Index', height=600, width=600)
+    if show:
+        fig.show()
+    return fig
+
+## ====================
 ## GRAPH UTILITIES
 ## ====================
 
@@ -201,15 +482,6 @@ def calc_degree_distribution_from_graph_matrix(adj_matrix):
     unique_degrees, counts = np.unique(degrees, return_counts=True)
     degree_likelihood = counts  #  / len(degrees) + 1e-100
     return unique_degrees, degree_likelihood
-
-def plot_graph_from_matrix(M, show=False):
-    fig = go.Figure()
-    dots = np.where(M == 1)
-    fig.add_trace(go.Scatter(x=dots[0], y=dots[1], mode='markers', marker=dict(size=0.5, color='black')))
-    fig.update_layout(title='Visibility Graph', xaxis_title='Node Index', yaxis_title='Node Index', height=600, width=600)
-    if show:
-        fig.show()
-    return fig
 
 ## ===============
 ## INFORMATION THEORETIC UTILITIES
@@ -410,6 +682,7 @@ def get_K(transition_matrix):
     K = edge_count / (transition_matrix.shape[0] * transition_matrix.shape[1])
     return K
 
+
 ## ====================
 ## SIMULATION UTILITIES
 ## ====================
@@ -502,7 +775,7 @@ def _band_limited_transition_matrix(nf, band_width, p_gap):
     A[nf] /= A[nf].sum()
     return A
 
-def viterbi_single_track_with_gap(Sxx, p_gap=None, prob_scale=1, band_width=None, sigma=None):
+def viterbi_single_track_with_gap(Sxx, p_gap=0.001, prob_scale=10, band_width=None, sigma=None):
     """
     Viterbi algorithm for single track with GAP state.
     Sxx: (nt, nf) log-likelihood spectrogram
@@ -532,7 +805,6 @@ def viterbi_single_track_with_gap(Sxx, p_gap=None, prob_scale=1, band_width=None
     # Main Viterbi recursion (vectorized)
     for t in range(1, nt):
         # compute scores for all previous states to all current states
-
         scores = V[t-1] + (transition_props_log * prob_scale)
 
         # max over previous state
@@ -599,13 +871,13 @@ def viterbi_multi_track(Sxx, band_width=5, p_gap=0.001, width=3, min_energy_rati
 
     return tracks
 
-def viterbi_from_welch_detection(Sxx, detected_frequencies, band_width, p_gap=None, prob_scale=1, sigma=None):
+def viterbi_from_welch_detection(Sxx, detected_frequencies, band_width, viterbi_band_width=None, p_gap=None, prob_scale=None):
     tracks = []
     for d in detected_frequencies:
         lb = max(0, d - band_width // 2)
         ub = min(Sxx.shape[1], d + band_width // 2 + 1)
         _S = Sxx[:, lb:ub]
-        track, score = viterbi_single_track_with_gap(_S, sigma=sigma, p_gap=p_gap, prob_scale=prob_scale)
+        track, score = viterbi_single_track_with_gap(_S, band_width=viterbi_band_width, p_gap=p_gap, prob_scale=prob_scale)
         track += lb  # adjust frequency indices
         tracks.append(track)
     return tracks
@@ -645,19 +917,3 @@ def plot_tracks_over_spectrogram(Sxx, f, t, tracks, title="Spectrogram with Vite
     )
 
     fig.show()
-
-def welch_detector_with_viterbi_tracks(Sxx, 
-                                       detection_height_threshold=None, 
-                                       detection_prominence_threshold=None,
-                                       detection_threshold=None,
-                                       normalization_window_size=None,
-                                       band_width=None,
-                                       sigma=None,
-                                       p_gap=None,
-                                       prob_scaling_factor=1):
-    pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=normalization_window_size)
-    height_threshold = np.average(pxx) + detection_height_threshold * np.std(pxx)
-    peaks, properties = find_peaks(pxx, height=height_threshold, prominence=detection_prominence_threshold, threshold=detection_threshold)
-    tracks = viterbi_from_welch_detection(Sxx, detected_frequencies=peaks, band_width=band_width, sigma=sigma, p_gap=p_gap, prob_scale=prob_scaling_factor)
-    return peaks, tracks
-
