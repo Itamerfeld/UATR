@@ -230,6 +230,12 @@ def running_window_spectrogram(x, fs, nperseg, percent_overlap, window='hamming'
         Sxx[i, :] = (np.abs(spectrum)**2) / (fs * window_power)
         Phase[i, :] = np.angle(spectrum)
 
+    if crop_freq is not None:
+        crop_band = f <= crop_freq
+        f = f[crop_band]
+        Sxx = Sxx[:, crop_band]
+        Phase = Phase[:, crop_band]
+
     return f, t, Sxx, Phase
 
 def welch_from_pmatrix(p_matrix, normalization_window_size=101):
@@ -292,6 +298,15 @@ def rw_normalization(x, window_size=17):
     ret[-window_size//2:] = ret[-window_size//2-1]
     return ret
 
+def rw_normalization2d(x, window_size=17):
+    if window_size % 2 == 0:
+        window_size += 1  # make it odd
+    normalization_kernel = np.ones((window_size, window_size)) / (window_size**2 - 1)
+    normalization_kernel[window_size // 2, window_size // 2] = 0
+    smooth_x = signal.convolve2d(x, normalization_kernel, mode='same')
+    ret = x / (smooth_x + 1e-10)
+    return ret
+
 def symmetry_enhancement(pxx, normalization_win=101, nperseg=1024):
     x = running_window_convolution(pxx, nperseg=nperseg)
     x = rw_normalization(x, window_size=normalization_win)
@@ -330,6 +345,38 @@ def rw_symmetry(pxx, window_size):
     # vals = np.abs(vals)
     # vals = rw_normalization(vals)
     return vals
+
+def rw_curvature(pxx, window_size):
+    half = window_size // 2
+    vals = np.zeros(pxx.shape[0])
+    for i in range(pxx.shape[0]):
+        # compute a local half-window without modifying the outer 'half' value
+        local_half = min(half, i, pxx.shape[0] - i - 1)
+        if local_half <= 0:
+            vals[i] = 0
+            continue
+
+        fw = pxx[i-local_half:i]
+        bw = pxx[i+1:i+local_half+1][::-1]
+
+        # ensure equal lengths (safety)
+        if fw.shape[0] != bw.shape[0]:
+            minlen = min(fw.shape[0], bw.shape[0])
+            fw = fw[-minlen:]
+            bw = bw[:minlen]
+        
+        vals[i] = np.sum((fw - bw)**2)
+
+    vals = rw_normalization(vals)
+    return vals
+
+def calc_local_curvature(pxx, normalization_window_size=None):
+    curvature = np.zeros_like(pxx)
+    for i in range(1, len(pxx)-1):
+        curvature[i] = np.abs(pxx[i+1] - 2*pxx[i] + pxx[i-1])
+    if normalization_window_size is not None:
+        curvature = rw_normalization(curvature, window_size=normalization_window_size)
+    return curvature
 
 ## ====================
 ## VISUALIZATION UTILITIES
@@ -666,3 +713,207 @@ def add_noise_to_signal(signal, noise, snr_db):
     noise = noise * scaling_factor
     noisy_signal = signal + noise
     return noisy_signal
+
+## ====================
+## Viterbi UTILITIES
+## ====================
+
+def _build_transition_matrix(f, sigma, p_birth, p_death, p_stay_gap):
+    """
+    Returns (F+1)x(F+1) transition matrix.
+    Last state index = GAP.
+    """
+    A = np.zeros((f+1, f+1))
+
+    # --- Frequency → Frequency ---
+    freq = np.arange(f)
+    for i in range(f):
+        A[i, :f] = np.exp(-0.5 * ((freq - i) / sigma)**2)
+
+    # Normalize rows
+    A[:f, :f] /= A[:f, :f].sum(axis=1, keepdims=True)
+
+    # --- Add death transitions ---
+    A[:f, f] = p_death
+    A[:f, :f] *= (1 - p_death)
+
+    # --- GAP transitions ---
+    A[f, f] = p_stay_gap
+    A[f, :f] = (1 - p_stay_gap) / f  # uniform birth
+    
+    # Normalize GAP row
+    A[f] /= A[f].sum()
+
+    return A
+
+def _band_limited_transition_matrix(nf, band_width, p_gap):
+    """
+    Returns (F+1)x(F+1) band-limited transition matrix.
+    Last state index = GAP.
+    """
+    A = np.zeros((nf+1, nf+1))
+
+    # --- Frequency → Frequency ---
+    # freq = np.arange(f)
+    for i in range(nf):
+        lower_bound = max(0, i - band_width)
+        upper_bound = min(nf, i + band_width + 1)
+        A[i, lower_bound:upper_bound] = 1
+    # Normalize rows
+    A[:nf, :nf] /= A[:nf, :nf].sum(axis=1, keepdims=True)
+    # --- Add death transitions ---
+    A[:nf, nf] = p_gap
+    A[:nf, :nf] *= (1 - p_gap)
+    # --- Add birth transitions ---
+    A[nf, :nf] = p_gap / nf  # uniform birth
+    A[nf, nf] = 1 - p_gap
+    # --- GAP transitions ---
+    # p_stay_gap = 1 - p_birth
+    # A[nf, nf] = p_stay_gap
+    # A[nf, :nf] = (1 - p_stay_gap) / nf  # uniform birth
+    # Normalize GAP row
+    A[nf] /= A[nf].sum()
+    return A
+
+def viterbi_single_track_with_gap(Sxx, p_gap=0.001, prob_scale=10, band_width=None, sigma=None):
+    """
+    Viterbi algorithm for single track with GAP state.
+    Sxx: (nt, nf) log-likelihood spectrogram
+    Returns: track (nt,) frequency indices
+    """
+    nt, nf = Sxx.shape
+    if band_width is None:
+        if sigma is None:
+            band_width = 5  # default value
+        else:
+            transition_props = _build_transition_matrix(nf, sigma=sigma, p_birth=p_gap, p_death=p_gap, p_stay_gap=1 - p_gap)
+    else:
+        transition_props = _band_limited_transition_matrix(nf, band_width=band_width, p_gap=p_gap)
+    transition_props_log = np.log(transition_props + 1e-300)
+
+    # Observation matrix extended with GAP
+    S_ext = np.zeros((nt, nf+1))
+    S_ext[:, :nf] = Sxx  # GAP has zero likelihood
+
+    # DP tables
+    V = np.zeros((nt, nf+1))       # V[t, state]
+    BP = np.zeros((nt, nf+1), dtype=np.int32)
+
+    # Initialization: all tracks start in GAP
+    V[0, :] = S_ext[0, :]  # all tracks identical at t=0
+
+    # Main Viterbi recursion (vectorized)
+    for t in range(1, nt):
+        # compute scores for all previous states to all current states
+        scores = V[t-1] + (transition_props_log * prob_scale)
+
+        # max over previous state
+        V[t] = S_ext[t][None, :] + np.max(scores, axis=1)
+
+        # store argmax
+        BP[t] = np.argmax(scores, axis=1)
+
+    track = np.zeros(nt, dtype=int)
+    track[nt-1] = np.argmax(V[nt-1, :])
+    for t in reversed(range(1, nt)):
+        track[t-1] = BP[t, track[t]]
+
+    score = V[nt-1, track[nt-1]]
+
+    return track, score
+
+def _mask_track(S, path, width):
+    """
+    Zero out energy around the extracted track.
+    width: number of bins around track to remove
+    """
+    T, N = S.shape
+    S2 = S.copy()
+    for t in range(T):
+        lo = max(0, path[t] - width)
+        hi = min(N, path[t] + width + 1)
+        S2[t, lo:hi] = 0
+    return S2
+
+def viterbi_multi_track(Sxx, band_width=5, p_gap=0.001, width=3, min_energy_ratio=0.2, prob_scale=100):
+    _S = Sxx.copy().astype(np.float32)
+    _S = (_S - np.min(_S)) / (np.max(_S) - np.min(_S) + 1e-300)  # normalize to [0, 1]
+    original_energy = np.sum(_S)
+    original_energy_percentile_per_time = np.percentile(_S, 5, axis=1)
+    
+    tracks = []
+    # scores = []
+    while True:
+        current_energy = np.sum(_S)
+        if np.log(current_energy) < np.log(original_energy) * 0.1:
+            print(f"Stopping track extraction: current energy {current_energy:.4f} below threshold.")
+            break
+
+        track, score = viterbi_single_track_with_gap(_S, band_width=band_width, p_gap=p_gap, prob_scale=prob_scale)
+
+        # # If the track has too little energy, stop
+
+        active_mask = (track < _S.shape[1])  # ignore GAP states
+        track_times = np.arange(_S.shape[0])[active_mask]
+        track_frequencies = track[active_mask]
+        track_values = _S[track_times, track_frequencies]
+        track_energy = np.sum(track_values)
+
+        if track_energy < np.percentile(original_energy_percentile_per_time, 5):
+            print(f"Stopping track extraction: track energy {track_energy:.4f} below threshold {original_energy * min_energy_ratio:.4f}.")
+            break
+
+        # if score
+
+        tracks.append((track_times, track_frequencies, track_energy))
+        # scores.append(score)
+        _S = _mask_track(_S, track, width=width)
+
+    return tracks
+
+def viterbi_from_welch_detection(Sxx, detected_frequencies, band_width, viterbi_band_width=None, p_gap=None, prob_scale=None):
+    tracks = []
+    for d in detected_frequencies:
+        lb = max(0, d - band_width // 2)
+        ub = min(Sxx.shape[1], d + band_width // 2 + 1)
+        _S = Sxx[:, lb:ub]
+        track, score = viterbi_single_track_with_gap(_S, band_width=viterbi_band_width, p_gap=p_gap, prob_scale=prob_scale)
+        track += lb  # adjust frequency indices
+        tracks.append(track)
+    return tracks
+
+def plot_tracks_over_spectrogram(Sxx, f, t, tracks, title="Spectrogram with Viterbi Tracks"):
+    fig = go.Figure()
+
+    # Spectrogram
+    fig.add_trace(go.Heatmap(
+        z=Sxx.T,
+        x=t,
+        y=f,
+        colorscale='magma',
+        showscale=False
+    ))
+
+    # Viterbi tracks
+    for k, track in enumerate(tracks):
+        track_times, track_freqs, track_energy = track
+        track_times = t[track_times]
+        track_freqs = f[track_freqs]
+        fig.add_trace(go.Scatter(
+            x=track_times,
+            y=track_freqs,
+            mode='lines',
+            line=dict(width=2, color='cyan'),
+            name=f'Track {k+1}'
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='Time (s)',
+        yaxis_title='Frequency (Hz)',
+        height=600,
+        width=800,
+        font=dict(size=12)
+    )
+
+    fig.show()
