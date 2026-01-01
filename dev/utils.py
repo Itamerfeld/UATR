@@ -1,12 +1,13 @@
+# imports and settings
+
 import os
 import time
 import pickle
+import librosa
+import warnings
+import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
-
-import mlx
-import mlx.core as mx
-import mlx.core.linalg as mxla
 
 import numpy as np
 from numpy import linalg as LA
@@ -14,9 +15,10 @@ from numpy import histogram2d
 
 from scipy import signal
 from scipy.fft import fft, fftfreq, fftshift
-from scipy.signal import find_peaks, butter, filtfilt, welch
+from scipy.signal import find_peaks, butter, filtfilt, sosfiltfilt, welch
 from scipy.ndimage import gaussian_filter
 from scipy.io import wavfile
+from scipy.stats import wasserstein_distance_nd
 
 import plotly.express as px
 import plotly.graph_objects as go
@@ -26,6 +28,22 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
+
+# import utils as ut
+# %load_ext autoreload
+# %autoreload 2
+
+# do not show warnings
+warnings.filterwarnings("ignore")
+
+print("Imports complete.")
+
+# plotting parameters
+height = 800
+width = 1400
+font_size = 16
+
+print(f"Settings: height={height}, width={width}, font_size={font_size}")
 
 ## ====================
 ## GENERAL UTILITIES
@@ -43,6 +61,130 @@ def slice_signal(data, annotations, fs, slice_duration=1.0, overlap=0.5, annotat
         _annotation = 1 if np.mean(annotations[start:end]) >= annotation_threshold else 0
         slice_annotations.append(_annotation)
     return np.array(slices), np.array(slice_annotations)
+
+def load_ds_samples(with_print=True, target_fs=None):
+    # dpv1 - croatia - speed 1
+    data_file = "../data/dpv1_1m.wav"
+    # dpv1_fs, dpv1_data = wavfile.read(data_file)
+    dpv1_data, dpv1_fs = librosa.load(data_file, sr=target_fs)
+    dpv1_slice = dpv1_data[int(35*dpv1_fs):int(45*dpv1_fs)]
+
+    # #dpv1 - croatia - speed 2
+    # data_file = "../data/dpv1_1m_3.wav"
+    # dpv1_2_fs, dpv1_2_data = wavfile.read(data_file)
+    # dpv1_2_slice = dpv1_2_data[int(35*dpv1_2_fs):int(45*dpv1_2_fs)]
+
+    # dpv2 - haifa
+    data_file = "../data/dpv2_1m.wav"
+    # dpv2_fs, dpv2_data = wavfile.read(data_file)
+    dpv2_data, dpv2_fs = librosa.load(data_file, sr=target_fs)
+    dpv2_slice = dpv2_data[int(15*dpv2_fs):int(25*dpv2_fs)]
+
+    # croatia boat noise
+    data_file = "../data/croatia_boat_2.wav"
+    # croatia_boat_fs, croatia_boat_data = wavfile.read(data_file)
+    croatia_boat_data, croatia_boat_fs = librosa.load(data_file, sr=target_fs)
+    croatia_boat_slice = croatia_boat_data[int(5*croatia_boat_fs):int(15*croatia_boat_fs)]
+
+    # # motorboat
+    # data_file = "../data/motorboat_1m.wav"
+    # motorboat_fs, motorboat_data = wavfile.read(data_file)
+    # motorboat_slice = motorboat_data[int(5*motorboat_fs):int(15*motorboat_fs)]
+
+    # # large ship
+    # data_file = "../data/large_ship_1m.wav"
+    # large_ship_fs, large_ship_data = wavfile.read(data_file)
+    # large_ship_slice = large_ship_data[int(5*large_ship_fs):int(15*large_ship_fs)]
+
+    # BG noise
+    data_file = "../data/bg_noise_1m.wav"
+    # bg_fs, bg_data = wavfile.read(data_file)
+    bg_data, bg_fs = librosa.load(data_file, sr=target_fs)
+    bg_slice = bg_data[int(5*bg_fs):int(15*bg_fs)]
+
+    # # BG noise 2
+    # data_file = "../data/bg_noise_2_1m.wav"
+    # bg2_fs, bg2_data = wavfile.read(data_file)
+    # bg2_slice = bg2_data[int(5*bg2_fs):int(15*bg2_fs)]
+
+    # organize samples
+    names = [
+        "dpv1",
+        # "dpv1_2",
+        "dpv2",
+        "croatia_ship",     
+        # "motorboat", 
+        # "large_ship", 
+        "bg_noise"
+        # "bg_noise_2"
+        ]
+
+    fss = {
+        "dpv1": dpv1_fs,
+        # "dpv1_2": dpv1_2_fs,
+        "dpv2": dpv2_fs,
+        "croatia_ship": croatia_boat_fs,
+        # "motorboat": motorboat_fs,
+        # "large_ship": large_ship_fs,
+        "bg_noise": bg_fs
+        # "bg_noise_2": bg2_fs,
+        }
+
+    all_data = {
+        "dpv1": dpv1_data,
+        # "dpv1_2": dpv1_2_data,
+        "dpv2": dpv2_data,
+        "croatia_ship": croatia_boat_data,
+        # "motorboat": motorboat_data,
+        # "large_ship": large_ship_data,
+        "bg_noise": bg_data
+        # "bg_noise_2": bg2_data,
+        }
+
+    slices = {
+        "dpv1": dpv1_slice,
+        # "dpv1_2": dpv1_2_slice,
+        "dpv2": dpv2_slice,
+        "croatia_ship": croatia_boat_slice,
+        # "motorboat": motorboat_slice,
+        # "large_ship": large_ship_slice,
+        "bg_noise": bg_slice
+        # "bg_noise_2": bg2_slice,
+        }
+    
+    # print info
+    if with_print:
+        print(f"Data dicts: ")
+        print(f"names={names}")
+        print(f"fss keys={list(fss.keys())}")
+        print(f"all_data keys={list(all_data.keys())}")
+        print(f"slices keys={list(slices.keys())}")
+
+    return names, fss, all_data, slices
+
+def explore_data(name_list, fs_dict, data_dict, fft_nperseg=32000, percent_overlap=0.5, window='hamming', remove_dc=20, crop_freq=None, detection_threshold=2, height=1600, width=1200, font_size=16):
+    all_peaks = {}
+    titles = [item for pair in zip(name_list, [""]*len(name_list)) for item in pair]
+    fig = make_subplots(rows=len(name_list), cols=2, vertical_spacing=0.02, subplot_titles=titles, horizontal_spacing=0.01, column_widths=[0.8, 0.2], shared_yaxes=True, shared_xaxes=True)
+
+    for i, name in enumerate(name_list, start=1):
+        fs = fs_dict[name]
+        data = data_dict[name]
+        F, T, Sxx, _ = calc_spectrogram(data, fs, fft_nperseg, percent_overlap, window, remove_dc, crop_freq)
+        pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=9) - 1
+        peaks = find_peaks(pxx, height=np.average(pxx) + detection_threshold * np.std(pxx))[0][1:]  # ignore DC peak
+        all_peaks[name] = peaks
+
+        fig.add_trace(go.Heatmap(x=T, y=F, z=Sxx, colorscale='Viridis', showscale=False), row=i, col=1)
+        fig.add_trace(go.Scatter(x=pxx, y=F, mode='lines', line=dict(color='blue')), row=i, col=2)
+        fig.add_trace(go.Scatter(x=pxx[peaks], y=F[peaks], mode='markers', marker=dict(color='red', size=6)), row=i, col=2)
+        fig.update_yaxes(title_text="Frequency (Hz)", row=i, col=1, title_font_size=font_size)
+        if i == len(name_list):
+            fig.update_xaxes(title_text="Time (s)", row=i, col=1, title_font_size=font_size) 
+        fig.update_yaxes(range=[0, crop_freq], row=i, col=1)
+
+    fig.update_layout(height=height, width=width, title_text="Spectrograms of Different Boat Noises", title_font_size=font_size+4)
+    fig.show()
 
 ## ====================
 ## SIGNAL PROCESSING UTILITIES
@@ -70,19 +212,7 @@ def rw_normalization2d(x, window_size=17):
     ret = x / (smooth_x + 1e-10)
     return ret
 
-def calc_spectrogram(x, fs, nperseg, percent_overlap, window='hamming', remove_dc=None, crop_freq=None):
-
-    # bandpass filter
-    if remove_dc is not None and crop_freq is not None:
-        b, a = butter(4, [remove_dc/(fs/2), crop_freq/(fs/2)], btype='band')
-        x = filtfilt(b, a, x)
-    elif remove_dc is not None:
-        b, a = butter(4, remove_dc/(fs/2), btype='high')
-        x = filtfilt(b, a, x)
-    elif crop_freq is not None:
-        b, a = butter(4, crop_freq/(fs/2), btype='low')
-        x = filtfilt(b, a, x)
-    
+def calc_spectrogram(x, fs, nperseg, percent_overlap, window='hamming', remove_dc=None, crop_freq=None, logscale=True):
     # prepare for PSD calculation
     noverlap = int(nperseg * percent_overlap)
     step = nperseg - noverlap
@@ -105,25 +235,41 @@ def calc_spectrogram(x, fs, nperseg, percent_overlap, window='hamming', remove_d
         Sxx[i, :] = (np.abs(spectrum)**2) / (fs * window_power)
         Phase[i, :] = np.angle(spectrum)
 
+    # remove DC component
+    if remove_dc is not None:
+        dc_band = f <= remove_dc
+        f = f[~dc_band]
+        Sxx = Sxx[:, ~dc_band]
+        Phase = Phase[:, ~dc_band]
+
     if crop_freq is not None:
+        if crop_freq > fs / 2:
+            crop_freq = fs // 2 - 1  # Nyquist limit
         crop_band = f <= crop_freq
         f = f[crop_band]
         Sxx = Sxx[:, crop_band]
         Phase = Phase[:, crop_band]
 
-    return f, t, Sxx, Phase
+    if logscale:
+        Sxx = 10 * np.log10(Sxx + 1e-100)
+
+    return f, t, Sxx.T, Phase.T
 
 def calc_welch_from_spectrogram(Sxx, normalization_window_size=None):
-    Pxx = np.mean(Sxx, axis=0)
+    Pxx = np.mean(Sxx, axis=1)
     if normalization_window_size is not None:
         Pxx = rw_normalization(Pxx, window_size=normalization_window_size)
+    Pxx = np.abs(Pxx - 1)
     return Pxx
 
 def calc_std_from_spectrogram(Sxx, normalization_window_size=None):
-    P_std = np.std(Sxx, axis=0)
+    P_std = np.std(Sxx, axis=1)
     if normalization_window_size is not None:
         P_std = rw_normalization(P_std, window_size=normalization_window_size)
     return P_std
+
+def calc_avg_diff_1d(x):
+    return np.log(np.average(np.abs(np.diff(x))) + 1e-100)
 
 def calc_avg_diff_from_spectrogram(Sxx, normalization_window_size=None):
     avg_diff = np.log(np.average(np.abs(np.diff(Sxx, axis=0)), axis=0))
@@ -153,7 +299,7 @@ def calc_rw_symmetry(pxx, window_size):
         vals[i] = np.convolve(fw, bw, mode='valid')[0]
     return vals
 
-def calc_rw_curvature(pxx, window_size):
+def calc_local_curvature(pxx, window_size):
     half = window_size // 2
     vals = np.zeros(pxx.shape[0])
     for i in range(pxx.shape[0]):
@@ -177,7 +323,7 @@ def calc_rw_curvature(pxx, window_size):
     vals = rw_normalization(vals)
     return vals
 
-def calc_local_curvature(pxx, normalization_window_size=None):
+def calc_curvature(pxx, normalization_window_size=None):
     curvature = np.zeros_like(pxx)
     for i in range(1, len(pxx)-1):
         curvature[i] = np.abs(pxx[i+1] - 2*pxx[i] + pxx[i-1])
@@ -205,24 +351,94 @@ def calc_degree_distribution_from_graph_matrix(adj_matrix):
 def plot_graph_from_matrix(M, show=False):
     fig = go.Figure()
     dots = np.where(M == 1)
-    fig.add_trace(go.Scatter(x=dots[0], y=dots[1], mode='markers', marker=dict(size=0.5, color='black')))
+    fig.add_trace(go.Scatter(x=dots[0], y=dots[1], mode='markers', marker=dict(size=0.5, color='black'), showlegend=False))
     fig.update_layout(title='Visibility Graph', xaxis_title='Node Index', yaxis_title='Node Index', height=600, width=600)
     if show:
         fig.show()
+    return fig
+
+def draw_graph(G):
+    # Calculate node positions using spring layout
+    pos = nx.spring_layout(G)
+
+    edge_x = []
+    edge_y = []
+    for edge in G.edges():
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        edge_x.append(x0)
+        edge_x.append(x1)
+        edge_x.append(None)
+        edge_y.append(y0)
+        edge_y.append(y1)
+        edge_y.append(None)
+
+    edge_trace = go.Scatter(x=edge_x, y=edge_y, line=dict(width=0.5, color='#888'), mode='lines', showlegend=False)
+
+    node_x = []
+    node_y = []
+    for node in G.nodes():
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode='markers',
+        hoverinfo='text',
+        showlegend=False,
+        marker=dict(showscale=False, colorscale='YlGnBu', reversescale=True, color=[], size=10, colorbar=dict(thickness=15, title=dict(text='Node Connections', side='right'), xanchor='left'), line_width=2))
+
+    node_adjacencies = []
+    # node_text = []
+    for node, adjacencies in enumerate(G.adjacency()):
+        node_adjacencies.append(len(adjacencies[1]))
+        # node_text.append('# of connections: '+str(len(adjacencies[1])))
+
+    node_trace.marker.color = node_adjacencies
+    node_trace.text = list(G.nodes())
+
+    fig = go.Figure(data=[edge_trace, node_trace], layout=go.Layout(showlegend=False, hovermode='closest', height=600, width=600,
+                    xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                    yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)))
     return fig
 
 ## ===============
 ## INFORMATION THEORETIC UTILITIES
 ## ===============
 
-def entropy(data, nbins="auto"):
+def entropy(data, nbins=None):
     n_samples = data.shape[0]
     if nbins == None:
         nbins = int((n_samples/5)**.5)
     histogram, _ = np.histogram(data, bins=nbins)
+    if np.any(np.isnan(histogram)):
+        print("Warning: NaN histogram encountered in entropy calculation. len data =", len(data))
+
     probs = histogram / len(data) + 1e-100
+    if np.any(np.isnan(probs)):
+        print(f"Warning: NaN probabilities encountered in entropy calculation.  len data = {len(data)}")
     entropy = -(probs * np.log2(probs)).sum()
     return entropy
+
+def mutual_information(x, y, nbins=None):
+    n_samples = x.shape[0]
+    if nbins == None:
+        nbins = int((n_samples/5)**.5)
+    hist_x, _ = np.histogram(x, bins=nbins)
+    hist_y, _ = np.histogram(y, bins=nbins)
+    hist_xy, _, _ = np.histogram2d(x, y, bins=nbins)
+
+    p_x = hist_x / n_samples + 1e-100
+    p_y = hist_y / n_samples + 1e-100
+    p_xy = hist_xy / n_samples + 1e-100
+
+    H_x = -(p_x * np.log2(p_x)).sum()
+    H_y = -(p_y * np.log2(p_y)).sum()
+    H_xy = -(p_xy * np.log2(p_xy)).sum()
+
+    mi = H_x + H_y - H_xy
+    return mi
 
 def entropy_of_frequencies(data, nbins="auto"):
     n_samples = data.shape[0]
@@ -259,7 +475,7 @@ def mutual_info_matrix(data, nbins=None, normalized=True):
         mi_matrix = mi_matrix * 2 / sum_entropies    
     return mi_matrix
 
-def compute_mi_adjacency_matrix(data, nbins=None, percentile_threshold=None, normalized=True):
+def calc_mi_adjacency_matrix(data, nbins=None, percentile_threshold=None, normalized=True):
     mi_matrix = mutual_info_matrix(data.T, nbins, normalized)
     if percentile_threshold is not None:
         threshold = np.percentile(mi_matrix, 100 - percentile_threshold)
@@ -393,10 +609,15 @@ def quantize_data(x, n_levels):
 
 def get_s2g_transition_matrix(x_quantized, n_levels):
     transitions = np.zeros((n_levels, n_levels), dtype=int)
-    for i in range(1, len(x_quantized)):
-        if x_quantized[i] != x_quantized[i-1]:
-            transitions[x_quantized[i-1], x_quantized[i]] += 1
-    return transitions # this is not normalized yet #TODO
+    for i in range(len(x_quantized)-1):
+        transitions[x_quantized[i], x_quantized[i+1]] += 1
+    return transitions
+
+def get_s2g(x, n_levels):
+    x = normalize_data(x)
+    x = quantize_data(x, n_levels)
+    transitions = get_s2g_transition_matrix(x, n_levels)
+    return transitions
 
 def get_s2g_edges(x_quantized):
     edges = []
@@ -405,9 +626,32 @@ def get_s2g_edges(x_quantized):
             edges.append((x_quantized[i-1], x_quantized[i]))
     return edges
 
-def get_K(transition_matrix):
-    edge_count = np.count_nonzero(transition_matrix, keepdims=True)
-    K = edge_count / (transition_matrix.shape[0] * transition_matrix.shape[1])
+def get_s2g_graph(x, n_levels):
+    x = normalize_data(x)
+    x = quantize_data(x, n_levels)
+    nodes = np.unique(x)
+    edges = get_s2g_edges(x)
+    G = nx.DiGraph()
+    G.add_nodes_from(nodes)
+    G.add_edges_from(edges)
+    return G
+
+def get_K(transition_matrix, mode='wasserstein'):
+    if mode == 'wasserstein':
+        uniform_dist = np.ones_like(transition_matrix) / transition_matrix.size
+        K = wasserstein_distance_nd(transition_matrix, uniform_dist)
+    elif mode == 'edge_count':    
+        edge_count = np.count_nonzero(transition_matrix)
+        K = edge_count / transition_matrix.size
+    elif mode == 'laplacian':
+        D = np.diag(np.sum(transition_matrix, axis=1))
+        L = D - transition_matrix
+        eigenvalues = LA.eig(L)
+        eigenvalues = np.real(eigenvalues)
+        eigenvalues = np.sort(eigenvalues)
+        K = eigenvalues[1]  # second smallest eigenvalue
+    else:
+        raise ValueError(f"Unknown K calculation mode: {mode}")
     return K
 
 ## ====================
@@ -656,8 +900,57 @@ def welch_detector_with_viterbi_tracks(Sxx,
                                        p_gap=None,
                                        prob_scaling_factor=1):
     pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=normalization_window_size)
+    pxx = calc_curvature(pxx)
     height_threshold = np.average(pxx) + detection_height_threshold * np.std(pxx)
     peaks, properties = find_peaks(pxx, height=height_threshold, prominence=detection_prominence_threshold, threshold=detection_threshold)
     tracks = viterbi_from_welch_detection(Sxx, detected_frequencies=peaks, band_width=band_width, sigma=sigma, p_gap=p_gap, prob_scale=prob_scaling_factor)
     return peaks, tracks
+
+def calc_tracks(data, 
+                fs, 
+                fft_nperseg, 
+                percent_overlap, 
+                window,
+                remove_dc, 
+                crop_freq, 
+                normalization_window_size, 
+                detection_threshold, 
+                p_gap, 
+                band_width, 
+                sigma, 
+                p_scale):
+    
+    F, T, Sxx, phase = calc_spectrogram(data, fs=fs, nperseg=fft_nperseg, percent_overlap=percent_overlap, window=window, remove_dc=remove_dc, crop_freq=crop_freq)
+    Sxx = 10 * np.log10(Sxx + 1e-12)
+    pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=normalization_window_size)
+    pxx = calc_curvature(pxx)
+    peaks, track_ixs = welch_detector_with_viterbi_tracks(Sxx, 
+                                                        normalization_window_size=normalization_window_size, 
+                                                        detection_height_threshold=detection_threshold, 
+                                                        sigma=sigma, 
+                                                        p_gap=p_gap, 
+                                                        band_width=band_width,
+                                                        prob_scaling_factor=p_scale)
+    tracks = []
+    for tix in track_ixs:
+        tracks.append(Sxx[np.arange(Sxx.shape[0]), tix])
+        
+    return F, T, Sxx, pxx, peaks, track_ixs, tracks
+
+def plot_tracks(F, T, Sxx, pxx, peaks, track_ixs, name, title="Spectrogram with Tracks", show=True):
+    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.8, 0.2], horizontal_spacing=0.15, vertical_spacing=0.15, column_titles=("Spectrogram", "Welch Power Spectral Density"))
+    fig.add_trace(go.Heatmap(x=T, y=F, z=Sxx.T, colorscale='Viridis', showscale=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=pxx, y=F, mode='lines', name='Welch PSD', showlegend=False, line=dict(color='blue', width=2)), row=1, col=2)
+    fig.add_trace(go.Scatter(x=pxx[peaks], y=F[peaks], mode='markers', name='Detected Peaks', marker=dict(color='cyan', size=8), showlegend=False), row=1, col=2)
+    for track in track_ixs:
+        fig.add_trace(go.Scatter(x=T, y=F[track], mode='markers', line=dict(color='cyan', width=1), name='Viterbi Track', showlegend=False), row=1, col=1)
+
+    fig.update_yaxes(title_text="Frequency (Hz)", row=1, col=1)
+    fig.update_xaxes(title_text="Time (s)", row=1, col=1)
+    fig.update_yaxes(title_text="Frequency (Hz)", row=1, col=2)
+    fig.update_xaxes(title_text="Power/Frequency (dB/Hz)", row=1, col=2)
+    fig.update_layout(height=height, width=width, title_text=f"Spectrogram and Welch PSD with Detected Peaks of {name}", font=dict(size=font_size))
+    if show:
+        fig.show()
+    return fig
 
