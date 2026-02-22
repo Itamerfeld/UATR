@@ -1,0 +1,12 @@
+# generate a requirements.txt file with all the dependencies of the project
+# including the ones that are not explicitly imported in the code but are used in the utils.py
+# and the ones that are used in the notebooks but not in the code
+# the requirements.txt file should be generated in the dev folder
+# the requirements.txt file should include the version of the dependencies
+# the requirements.txt file should be generated using pip freeze
+
+# requirements.txt file
+numpy==1.24.3
+scipy==1.10.1
+matplotlib==3.7.1
+scikit-learn==1.2.2

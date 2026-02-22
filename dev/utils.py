@@ -1,6 +1,7 @@
 # imports and settings
 
 import os
+from statistics import mode
 import time
 import pickle
 import librosa
@@ -46,145 +47,188 @@ font_size = 16
 print(f"Settings: height={height}, width={width}, font_size={font_size}")
 
 ## ====================
-## GENERAL UTILITIES
+## DETECTORS
 ## ====================
 
-def slice_signal(data, annotations, fs, slice_duration=1.0, overlap=0.5, annotation_threshold=0.25):
-    slice_length = int(slice_duration * fs)
-    step = int(slice_length * (1 - overlap))
-    slices = []
-    slice_annotations = []
-    for start in range(0, len(data) - slice_length + 1, step):
-        end = start + slice_length
-        slices.append(data[start:end])
-        # Get annotations for the current slice
-        _annotation = 1 if np.mean(annotations[start:end]) >= annotation_threshold else 0
-        slice_annotations.append(_annotation)
-    return np.array(slices), np.array(slice_annotations)
+class WelchDetector:
+    def __init__(self, fs, nperseg, overlap, window, dc, crop_freq, norm_size, default_distance=3):
+        self.fs = fs
+        self.nperseg = nperseg
+        self.overlap = overlap
+        self.window = window
+        self.dc = dc
+        self.crop_freq = crop_freq
+        self.norm_size = norm_size
+        self.default_distance = default_distance
 
-def load_ds_samples(with_print=True, target_fs=None):
-    # dpv1 - croatia - speed 1
-    data_file = "../data/dpv1_1m.wav"
-    # dpv1_fs, dpv1_data = wavfile.read(data_file)
-    dpv1_data, dpv1_fs = librosa.load(data_file, sr=target_fs)
-    dpv1_slice = dpv1_data[int(35*dpv1_fs):int(45*dpv1_fs)]
-
-    # #dpv1 - croatia - speed 2
-    # data_file = "../data/dpv1_1m_3.wav"
-    # dpv1_2_fs, dpv1_2_data = wavfile.read(data_file)
-    # dpv1_2_slice = dpv1_2_data[int(35*dpv1_2_fs):int(45*dpv1_2_fs)]
-
-    # dpv2 - haifa
-    data_file = "../data/dpv2_1m.wav"
-    # dpv2_fs, dpv2_data = wavfile.read(data_file)
-    dpv2_data, dpv2_fs = librosa.load(data_file, sr=target_fs)
-    dpv2_slice = dpv2_data[int(15*dpv2_fs):int(25*dpv2_fs)]
-
-    # croatia boat noise
-    data_file = "../data/croatia_boat_2.wav"
-    # croatia_boat_fs, croatia_boat_data = wavfile.read(data_file)
-    croatia_boat_data, croatia_boat_fs = librosa.load(data_file, sr=target_fs)
-    croatia_boat_slice = croatia_boat_data[int(5*croatia_boat_fs):int(15*croatia_boat_fs)]
-
-    # # motorboat
-    # data_file = "../data/motorboat_1m.wav"
-    # motorboat_fs, motorboat_data = wavfile.read(data_file)
-    # motorboat_slice = motorboat_data[int(5*motorboat_fs):int(15*motorboat_fs)]
-
-    # # large ship
-    # data_file = "../data/large_ship_1m.wav"
-    # large_ship_fs, large_ship_data = wavfile.read(data_file)
-    # large_ship_slice = large_ship_data[int(5*large_ship_fs):int(15*large_ship_fs)]
-
-    # BG noise
-    data_file = "../data/bg_noise_1m.wav"
-    # bg_fs, bg_data = wavfile.read(data_file)
-    bg_data, bg_fs = librosa.load(data_file, sr=target_fs)
-    bg_slice = bg_data[int(5*bg_fs):int(15*bg_fs)]
-
-    # # BG noise 2
-    # data_file = "../data/bg_noise_2_1m.wav"
-    # bg2_fs, bg2_data = wavfile.read(data_file)
-    # bg2_slice = bg2_data[int(5*bg2_fs):int(15*bg2_fs)]
-
-    # organize samples
-    names = [
-        "dpv1",
-        # "dpv1_2",
-        "dpv2",
-        "croatia_ship",     
-        # "motorboat", 
-        # "large_ship", 
-        "bg_noise"
-        # "bg_noise_2"
-        ]
-
-    fss = {
-        "dpv1": dpv1_fs,
-        # "dpv1_2": dpv1_2_fs,
-        "dpv2": dpv2_fs,
-        "croatia_ship": croatia_boat_fs,
-        # "motorboat": motorboat_fs,
-        # "large_ship": large_ship_fs,
-        "bg_noise": bg_fs
-        # "bg_noise_2": bg2_fs,
-        }
-
-    all_data = {
-        "dpv1": dpv1_data,
-        # "dpv1_2": dpv1_2_data,
-        "dpv2": dpv2_data,
-        "croatia_ship": croatia_boat_data,
-        # "motorboat": motorboat_data,
-        # "large_ship": large_ship_data,
-        "bg_noise": bg_data
-        # "bg_noise_2": bg2_data,
-        }
-
-    slices = {
-        "dpv1": dpv1_slice,
-        # "dpv1_2": dpv1_2_slice,
-        "dpv2": dpv2_slice,
-        "croatia_ship": croatia_boat_slice,
-        # "motorboat": motorboat_slice,
-        # "large_ship": large_ship_slice,
-        "bg_noise": bg_slice
-        # "bg_noise_2": bg2_slice,
-        }
+    def detect(self, rx, threshold):
+        pxx = self.get_feature_vector(rx)
+        # TH = np.mean(pxx) + threshold * np.std(pxx)
+        TH = threshold
+        detections = find_peaks(pxx, height=TH, distance=self.default_distance)[0]
+        is_detected = len(detections) > 0
+        return is_detected, detections
     
-    # print info
-    if with_print:
-        print(f"Data dicts: ")
-        print(f"names={names}")
-        print(f"fss keys={list(fss.keys())}")
-        print(f"all_data keys={list(all_data.keys())}")
-        print(f"slices keys={list(slices.keys())}")
+    def get_feature_vector(self, rx):
+        F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
+        pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=self.norm_size)
+        return pxx
+        
+class S2GDetector:
+    def __init__(self, fs, nperseg, overlap, window, dc, crop_freq, quantization_levels, mode="wasserstein", default_distance=2):
+        self.fs = fs
+        self.nperseg = nperseg
+        self.overlap = overlap
+        self.window = window
+        self.dc = dc
+        self.crop_freq = crop_freq
+        self.quantization_levels = quantization_levels
+        self.mode = mode
+        self.default_distance = default_distance
 
-    return names, fss, all_data, slices
+    def detect(self, rx, threshold):
+        K = self.get_feature_vector(rx)
+        # TH = np.mean(K) + (2+threshold) * np.std(K)
+        TH = threshold
+        detections = find_peaks(K, height=TH, distance=self.default_distance)[0]
+        is_detected = len(detections) > 0
+        return is_detected, detections, K
+    
+    def get_feature_vector(self, rx):
+        F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
+        K = get_all_Ks(phasogram, F, n_levels=self.quantization_levels, mode=self.mode)
+        if self.mode == "edge_count":
+            K = 1 - K
+        if self.mode == "laplacian":
+            K = (K - np.min(K)) / (np.max(K) - np.min(K))  # normalize to [0,1]
+            K = 1 - K
+        if self.mode == "wasserstein":
+            K = (K - np.min(K)) / (np.max(K) - np.min(K))  # normalize to [0,1]
+        return K
 
-def explore_data(name_list, fs_dict, data_dict, fft_nperseg=32000, percent_overlap=0.5, window='hamming', remove_dc=20, crop_freq=None, detection_threshold=2, height=1600, width=1200, font_size=16):
-    all_peaks = {}
-    titles = [item for pair in zip(name_list, [""]*len(name_list)) for item in pair]
-    fig = make_subplots(rows=len(name_list), cols=2, vertical_spacing=0.02, subplot_titles=titles, horizontal_spacing=0.01, column_widths=[0.8, 0.2], shared_yaxes=True, shared_xaxes=True)
+## ====================
+## S2G UTILITIES
+## ====================
 
-    for i, name in enumerate(name_list, start=1):
-        fs = fs_dict[name]
-        data = data_dict[name]
-        F, T, Sxx, _ = calc_spectrogram(data, fs, fft_nperseg, percent_overlap, window, remove_dc, crop_freq)
-        pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=9) - 1
-        peaks = find_peaks(pxx, height=np.average(pxx) + detection_threshold * np.std(pxx))[0][1:]  # ignore DC peak
-        all_peaks[name] = peaks
+def normalize_data(x):
+    x = x / 2  # this is necessary to avoid overflow in some cases due to super large values (probably a bug somewhere else)
+    xmin = np.min(x)
+    xmax = np.max(x)
+    normalized_data = (x - xmin) / (xmax - xmin) if xmax != xmin else 0
+    return normalized_data
 
-        fig.add_trace(go.Heatmap(x=T, y=F, z=Sxx, colorscale='Viridis', showscale=False), row=i, col=1)
-        fig.add_trace(go.Scatter(x=pxx, y=F, mode='lines', line=dict(color='blue')), row=i, col=2)
-        fig.add_trace(go.Scatter(x=pxx[peaks], y=F[peaks], mode='markers', marker=dict(color='red', size=6)), row=i, col=2)
-        fig.update_yaxes(title_text="Frequency (Hz)", row=i, col=1, title_font_size=font_size)
-        if i == len(name_list):
-            fig.update_xaxes(title_text="Time (s)", row=i, col=1, title_font_size=font_size) 
-        fig.update_yaxes(range=[0, crop_freq], row=i, col=1)
+def quantize_data(x, n_levels):
+    x_quantized = np.floor(x * n_levels).astype(int)
+    x_quantized[x_quantized == n_levels] = n_levels - 1  # Handle edge case
+    return x_quantized
 
-    fig.update_layout(height=height, width=width, title_text="Spectrograms of Different Boat Noises", title_font_size=font_size+4)
-    fig.show()
+def get_s2g_transition_matrix(x_quantized, n_levels):
+    transitions = np.zeros((n_levels, n_levels), dtype=int)
+    for i in range(len(x_quantized)-1):
+        transitions[x_quantized[i], x_quantized[i+1]] += 1
+    return transitions
+
+def get_s2g(x, n_levels):
+    x = normalize_data(x)
+    x = quantize_data(x, n_levels)
+    transitions = get_s2g_transition_matrix(x, n_levels)
+    return transitions
+
+def get_s2g_edges(x_quantized):
+    edges = []
+    for i in range(1, len(x_quantized)):
+        if x_quantized[i] != x_quantized[i-1]:
+            edges.append((x_quantized[i-1], x_quantized[i]))
+    return edges
+
+def get_s2g_graph(x, n_levels):
+    x = normalize_data(x)
+    x = quantize_data(x, n_levels)
+    nodes = np.unique(x)
+    edges = get_s2g_edges(x)
+    G = nx.DiGraph()
+    G.add_nodes_from(nodes)
+    G.add_edges_from(edges)
+    return G
+
+def get_K(transition_matrix, mode='wasserstein', uniform_M=None):
+    if mode == 'wasserstein':
+        if uniform_M is not None:
+            uniform_dist = uniform_M
+        else:
+            uniform_dist = np.ones(transition_matrix.shape) / transition_matrix.size
+        K = wasserstein_distance_nd(transition_matrix, uniform_dist)
+    elif mode == 'edge_count':    
+        edge_count = np.count_nonzero(transition_matrix)
+        K = edge_count / transition_matrix.size
+    elif mode == 'laplacian':
+        D = np.diag(np.sum(transition_matrix, axis=1))
+        L = D - transition_matrix
+        eigenvalues = LA.eigvals(L)  # only eigenvalues; avoids mixed tuple
+        eigenvalues = np.real(eigenvalues)
+        eigenvalues = np.sort(eigenvalues)
+        # use Fiedler value when available; fallback to first eigenvalue for 1x1
+        K = eigenvalues[1] if eigenvalues.size > 1 else eigenvalues[0]
+    elif mode == 'all':
+        K1 = get_K(transition_matrix, mode='wasserstein')
+        K2 = get_K(transition_matrix, mode='edge_count')
+        K3 = get_K(transition_matrix, mode='laplacian')
+        K = (K1, K2, K3)
+    else:
+        raise ValueError(f"Unknown K calculation mode: {mode}")
+    return K
+
+def get_all_Ks(phase_matrix, frequencies, n_levels, mode='wasserstein'):
+    Ks = []
+    if mode == 'wasserstein':
+        uniform_M = np.ones((n_levels, n_levels)) / (n_levels**2)
+    else:
+        uniform_M = None
+    for f_idx, f in enumerate(frequencies):
+        x = phase_matrix[f_idx, :]
+        transition_matrix = get_s2g(x, n_levels=n_levels)
+        K = get_K(transition_matrix, mode=mode, uniform_M=uniform_M)
+        Ks.append(K)
+    Ks = np.array(Ks[:-1])  # exclude last frequency if it's the Nyquist frequency (which may be less reliable)
+    return Ks
+
+## ====================
+## SIMULATION UTILITIES
+## ====================
+
+def pink_noise(N):
+    # Voss-McCartney algorithm
+    n = int(np.ceil(np.log2(N)))
+    array = np.random.randn(n, N)
+    array = np.cumsum(array, axis=0)
+    weights = 1 / (2 ** np.arange(n))
+    pink = np.dot(weights, array)
+    return pink[:N]
+
+def white_noise(N):
+    return np.random.rand(N)
+
+def simulate_raw_signal(f0, fs, duration):
+    t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+    sig = 0.5 * np.sin(2 * np.pi * f0 * t)
+    return sig
+
+def add_noise_to_signal(signal, snr_db, noise_type='white'):
+
+    if noise_type == 'white':
+        noise = white_noise(len(signal))
+    elif noise_type == 'pink':
+        noise = pink_noise(len(signal))
+    else:
+        raise ValueError(f"Unknown noise type: {noise_type}")
+    
+    signal_power = np.mean(signal ** 2)
+    noise_power = np.mean(noise ** 2)
+    desired_noise_power = signal_power / (10 ** (snr_db / 10))
+    scaling_factor = np.sqrt(desired_noise_power / noise_power)
+    noise = noise * scaling_factor
+    noisy_signal = signal + noise
+    return noisy_signal
 
 ## ====================
 ## SIGNAL PROCESSING UTILITIES
@@ -592,100 +636,6 @@ def calc_vis_graph_generalized(x, y, return_Adj=True):
     return vis
 
 ## ====================
-## S2G UTILITIES
-## ====================
-
-def normalize_data(x):
-    x = x / 2  # this is necessary to avoid overflow in some cases due to super large values (probably a bug somewhere else)
-    xmin = np.min(x)
-    xmax = np.max(x)
-    normalized_data = (x - xmin) / (xmax - xmin) if xmax != xmin else 0
-    return normalized_data
-
-def quantize_data(x, n_levels):
-    x_quantized = np.floor(x * n_levels).astype(int)
-    x_quantized[x_quantized == n_levels] = n_levels - 1  # Handle edge case
-    return x_quantized
-
-def get_s2g_transition_matrix(x_quantized, n_levels):
-    transitions = np.zeros((n_levels, n_levels), dtype=int)
-    for i in range(len(x_quantized)-1):
-        transitions[x_quantized[i], x_quantized[i+1]] += 1
-    return transitions
-
-def get_s2g(x, n_levels):
-    x = normalize_data(x)
-    x = quantize_data(x, n_levels)
-    transitions = get_s2g_transition_matrix(x, n_levels)
-    return transitions
-
-def get_s2g_edges(x_quantized):
-    edges = []
-    for i in range(1, len(x_quantized)):
-        if x_quantized[i] != x_quantized[i-1]:
-            edges.append((x_quantized[i-1], x_quantized[i]))
-    return edges
-
-def get_s2g_graph(x, n_levels):
-    x = normalize_data(x)
-    x = quantize_data(x, n_levels)
-    nodes = np.unique(x)
-    edges = get_s2g_edges(x)
-    G = nx.DiGraph()
-    G.add_nodes_from(nodes)
-    G.add_edges_from(edges)
-    return G
-
-def get_K(transition_matrix, mode='wasserstein'):
-    if mode == 'wasserstein':
-        uniform_dist = np.ones_like(transition_matrix) / transition_matrix.size
-        K = wasserstein_distance_nd(transition_matrix, uniform_dist)
-    elif mode == 'edge_count':    
-        edge_count = np.count_nonzero(transition_matrix)
-        K = edge_count / transition_matrix.size
-    elif mode == 'laplacian':
-        D = np.diag(np.sum(transition_matrix, axis=1))
-        L = D - transition_matrix
-        eigenvalues = LA.eig(L)
-        eigenvalues = np.real(eigenvalues)
-        eigenvalues = np.sort(eigenvalues)
-        K = eigenvalues[1]  # second smallest eigenvalue
-    else:
-        raise ValueError(f"Unknown K calculation mode: {mode}")
-    return K
-
-## ====================
-## SIMULATION UTILITIES
-## ====================
-
-def pink_noise(N):
-    # Voss-McCartney algorithm
-    n = int(np.ceil(np.log2(N)))
-    array = np.random.randn(n, N)
-    array = np.cumsum(array, axis=0)
-    weights = 1 / (2 ** np.arange(n))
-    pink = np.dot(weights, array)
-    return pink[:N]
-
-def simulate_raw_signal(f0, fs, duration, snr_db):
-    t = np.linspace(0, duration, int(fs * duration), endpoint=False)
-    signal = 0.5 * np.sin(2 * np.pi * f0 * t)
-    signal_power = np.mean(signal ** 2)
-    snr_linear = 10 ** (snr_db / 10)
-    noise_power = signal_power / snr_linear
-    noise = np.sqrt(noise_power) * pink_noise(len(signal))
-    return signal + noise
-
-def add_noise_to_signal(signal, noise, snr_db):
-    signal_power = np.mean(signal ** 2)
-    noise_power = np.mean(noise ** 2)
-    desired_noise_power = signal_power / (10 ** (snr_db / 10))
-    scaling_factor = np.sqrt(desired_noise_power / noise_power)
-    noise = noise * scaling_factor
-    noisy_signal = signal + noise
-    return noisy_signal
-
-## ====================
 ## Viterbi UTILITIES
 ## ====================
 
@@ -953,4 +903,144 @@ def plot_tracks(F, T, Sxx, pxx, peaks, track_ixs, name, title="Spectrogram with 
     if show:
         fig.show()
     return fig
+
+## ====================
+## GENERAL UTILITIES
+## ====================
+
+def slice_signal(data, annotations, fs, slice_duration=1.0, overlap=0.5, annotation_threshold=0.25):
+    slice_length = int(slice_duration * fs)
+    step = int(slice_length * (1 - overlap))
+    slices = []
+    slice_annotations = []
+    for start in range(0, len(data) - slice_length + 1, step):
+        end = start + slice_length
+        slices.append(data[start:end])
+        # Get annotations for the current slice
+        _annotation = 1 if np.mean(annotations[start:end]) >= annotation_threshold else 0
+        slice_annotations.append(_annotation)
+    return np.array(slices), np.array(slice_annotations)
+
+def load_ds_samples(with_print=True, target_fs=None):
+    # dpv1 - croatia - speed 1
+    data_file = "../data/dpv1_1m.wav"
+    # dpv1_fs, dpv1_data = wavfile.read(data_file)
+    dpv1_data, dpv1_fs = librosa.load(data_file, sr=target_fs)
+    dpv1_slice = dpv1_data[int(35*dpv1_fs):int(45*dpv1_fs)]
+
+    # #dpv1 - croatia - speed 2
+    # data_file = "../data/dpv1_1m_3.wav"
+    # dpv1_2_fs, dpv1_2_data = wavfile.read(data_file)
+    # dpv1_2_slice = dpv1_2_data[int(35*dpv1_2_fs):int(45*dpv1_2_fs)]
+
+    # dpv2 - haifa
+    data_file = "../data/dpv2_1m.wav"
+    # dpv2_fs, dpv2_data = wavfile.read(data_file)
+    dpv2_data, dpv2_fs = librosa.load(data_file, sr=target_fs)
+    dpv2_slice = dpv2_data[int(15*dpv2_fs):int(25*dpv2_fs)]
+
+    # croatia boat noise
+    data_file = "../data/croatia_boat_2.wav"
+    # croatia_boat_fs, croatia_boat_data = wavfile.read(data_file)
+    croatia_boat_data, croatia_boat_fs = librosa.load(data_file, sr=target_fs)
+    croatia_boat_slice = croatia_boat_data[int(5*croatia_boat_fs):int(15*croatia_boat_fs)]
+
+    # # motorboat
+    # data_file = "../data/motorboat_1m.wav"
+    # motorboat_fs, motorboat_data = wavfile.read(data_file)
+    # motorboat_slice = motorboat_data[int(5*motorboat_fs):int(15*motorboat_fs)]
+
+    # # large ship
+    # data_file = "../data/large_ship_1m.wav"
+    # large_ship_fs, large_ship_data = wavfile.read(data_file)
+    # large_ship_slice = large_ship_data[int(5*large_ship_fs):int(15*large_ship_fs)]
+
+    # BG noise
+    data_file = "../data/bg_noise_1m.wav"
+    # bg_fs, bg_data = wavfile.read(data_file)
+    bg_data, bg_fs = librosa.load(data_file, sr=target_fs)
+    bg_slice = bg_data[int(5*bg_fs):int(15*bg_fs)]
+
+    # # BG noise 2
+    # data_file = "../data/bg_noise_2_1m.wav"
+    # bg2_fs, bg2_data = wavfile.read(data_file)
+    # bg2_slice = bg2_data[int(5*bg2_fs):int(15*bg2_fs)]
+
+    # organize samples
+    names = [
+        "dpv1",
+        # "dpv1_2",
+        "dpv2",
+        "croatia_ship",     
+        # "motorboat", 
+        # "large_ship", 
+        "bg_noise"
+        # "bg_noise_2"
+        ]
+
+    fss = {
+        "dpv1": dpv1_fs,
+        # "dpv1_2": dpv1_2_fs,
+        "dpv2": dpv2_fs,
+        "croatia_ship": croatia_boat_fs,
+        # "motorboat": motorboat_fs,
+        # "large_ship": large_ship_fs,
+        "bg_noise": bg_fs
+        # "bg_noise_2": bg2_fs,
+        }
+
+    all_data = {
+        # "dpv1_2": dpv1_2_data,
+        "dpv2": dpv2_data,
+        "croatia_ship": croatia_boat_data,
+        # "motorboat": motorboat_data,
+        # "large_ship": large_ship_data,
+        "bg_noise": bg_data
+        # "bg_noise_2": bg2_data,
+        }
+
+    slices = {
+        "dpv1": dpv1_slice,
+        # "dpv1_2": dpv1_2_slice,
+        "dpv2": dpv2_slice,
+        "croatia_ship": croatia_boat_slice,
+        # "motorboat": motorboat_slice,
+        # "large_ship": large_ship_slice,
+        "bg_noise": bg_slice
+        # "bg_noise_2": bg2_slice,
+        }
+    
+    # print info
+    if with_print:
+        print(f"Data dicts: ")
+        print(f"names={names}")
+        print(f"fss keys={list(fss.keys())}")
+        print(f"all_data keys={list(all_data.keys())}")
+        print(f"slices keys={list(slices.keys())}")
+
+    return names, fss, all_data, slices
+
+def explore_data(name_list, fs_dict, data_dict, fft_nperseg=32000, percent_overlap=0.5, window='hamming', remove_dc=20, crop_freq=None, detection_threshold=2, height=1600, width=1200, font_size=16):
+    all_peaks = {}
+    titles = [item for pair in zip(name_list, [""]*len(name_list)) for item in pair]
+    fig = make_subplots(rows=len(name_list), cols=2, vertical_spacing=0.02, subplot_titles=titles, horizontal_spacing=0.01, column_widths=[0.8, 0.2], shared_yaxes=True, shared_xaxes=True)
+
+    for i, name in enumerate(name_list, start=1):
+        fs = fs_dict[name]
+        data = data_dict[name]
+        F, T, Sxx, _ = calc_spectrogram(data, fs, fft_nperseg, percent_overlap, window, remove_dc, crop_freq)
+        pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=9) - 1
+        peaks = find_peaks(pxx, height=np.average(pxx) + detection_threshold * np.std(pxx))[0][1:]  # ignore DC peak
+        all_peaks[name] = peaks
+
+        fig.add_trace(go.Heatmap(x=T, y=F, z=Sxx, colorscale='Viridis', showscale=False), row=i, col=1)
+        fig.add_trace(go.Scatter(x=pxx, y=F, mode='lines', line=dict(color='blue')), row=i, col=2)
+        fig.add_trace(go.Scatter(x=pxx[peaks], y=F[peaks], mode='markers', marker=dict(color='red', size=6)), row=i, col=2)
+        fig.update_yaxes(title_text="Frequency (Hz)", row=i, col=1, title_font_size=font_size)
+        if i == len(name_list):
+            fig.update_xaxes(title_text="Time (s)", row=i, col=1, title_font_size=font_size) 
+        fig.update_yaxes(range=[0, crop_freq], row=i, col=1)
+
+    fig.update_layout(height=height, width=width, title_text="Spectrograms of Different Boat Noises", title_font_size=font_size+4)
+    fig.show()
 

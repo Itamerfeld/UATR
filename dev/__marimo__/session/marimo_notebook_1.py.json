@@ -3,5 +3,26 @@
   "metadata": {
     "marimo_version": "0.18.4"
   },
-  "cells": []
+  "cells": [
+    {
+      "id": "Hbol",
+      "code_hash": "8cbc3ac87504bbfbbd212461bbc5b4d8",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": [
+        {
+          "type": "stream",
+          "name": "stdout",
+          "text": "Imports complete.\nSettings: height=800, width=1400, font_size=16\nImports complete.\n",
+          "mimetype": "text/plain"
+        }
+      ]
+    }
+  ]
 }
