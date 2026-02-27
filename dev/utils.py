@@ -62,17 +62,17 @@ class WelchDetector:
         self.default_distance = default_distance
 
     def detect(self, rx, threshold):
-        pxx = self.get_feature_vector(rx)
+        pxx, F = self.get_feature_vector(rx)
         # TH = np.mean(pxx) + threshold * np.std(pxx)
         TH = threshold
         detections = find_peaks(pxx, height=TH, distance=self.default_distance)[0]
         is_detected = len(detections) > 0
-        return is_detected, detections
+        return is_detected, detections, (pxx, F)
     
     def get_feature_vector(self, rx):
         F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
         pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=self.norm_size)
-        return pxx
+        return pxx, F
         
 class S2GDetector:
     def __init__(self, fs, nperseg, overlap, window, dc, crop_freq, quantization_levels, mode="wasserstein", default_distance=2):
@@ -87,12 +87,12 @@ class S2GDetector:
         self.default_distance = default_distance
 
     def detect(self, rx, threshold):
-        K = self.get_feature_vector(rx)
+        K, F = self.get_feature_vector(rx)
         # TH = np.mean(K) + (2+threshold) * np.std(K)
         TH = threshold
         detections = find_peaks(K, height=TH, distance=self.default_distance)[0]
         is_detected = len(detections) > 0
-        return is_detected, detections, K
+        return is_detected, detections, (K, F)
     
     def get_feature_vector(self, rx):
         F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
@@ -100,11 +100,13 @@ class S2GDetector:
         if self.mode == "edge_count":
             K = 1 - K
         if self.mode == "laplacian":
-            K = (K - np.min(K)) / (np.max(K) - np.min(K))  # normalize to [0,1]
-            K = 1 - K
+            # K = (K - np.min(K)) / (np.max(K) - np.min(K))  # normalize to [0,1]
+            # K = np.mean(K) - K
+            K = K / np.mean(K)
+            K = np.mean(K) - K
         if self.mode == "wasserstein":
             K = (K - np.min(K)) / (np.max(K) - np.min(K))  # normalize to [0,1]
-        return K
+        return K, F
 
 ## ====================
 ## S2G UTILITIES
@@ -213,21 +215,52 @@ def simulate_raw_signal(f0, fs, duration):
     sig = 0.5 * np.sin(2 * np.pi * f0 * t)
     return sig
 
-def add_noise_to_signal(signal, snr_db, noise_type='white'):
+# def add_noise_to_signal(signal, snr_db, noise_type='white'):
 
+#     if noise_type == 'white':
+#         noise = white_noise(len(signal))
+#     elif noise_type == 'pink':
+#         noise = pink_noise(len(signal))
+#     else:
+#         raise ValueError(f"Unknown noise type: {noise_type}")
+    
+#     signal_power = np.mean(signal ** 2)
+#     noise_power = np.mean(noise ** 2)
+#     desired_noise_power = signal_power / (10 ** (snr_db / 10))
+#     scaling_factor = np.sqrt(desired_noise_power / noise_power)
+#     noise = noise * scaling_factor
+#     noisy_signal = signal + noise
+#     return noisy_signal
+
+def add_noise_to_signal(signal, snr_db, fs, signal_bw, noise_type='white'):
+    """
+    Adds broad-band noise to a narrow-band signal based on an in-band SNR.
+    """
     if noise_type == 'white':
-        noise = white_noise(len(signal))
+        noise = white_noise(len(signal)) # Assuming this returns unscaled white noise
     elif noise_type == 'pink':
-        noise = pink_noise(len(signal))
+        noise = pink_noise(len(signal))  # Assuming this returns unscaled pink noise
     else:
         raise ValueError(f"Unknown noise type: {noise_type}")
     
+    # 1. Calculate actual signal power
     signal_power = np.mean(signal ** 2)
-    noise_power = np.mean(noise ** 2)
-    desired_noise_power = signal_power / (10 ** (snr_db / 10))
-    scaling_factor = np.sqrt(desired_noise_power / noise_power)
-    noise = noise * scaling_factor
-    noisy_signal = signal + noise
+    
+    # 2. Calculate the desired noise power *within the signal's bandwidth*
+    desired_noise_power_in_band = signal_power / (10 ** (snr_db / 10))
+    
+    # 3. Scale up to total noise power across the entire Nyquist band (fs/2)
+    # Note: This linear scaling assumes a flat noise spectrum (White noise). 
+    bandwidth_ratio = (fs / 2) / signal_bw
+    total_desired_noise_power = desired_noise_power_in_band * bandwidth_ratio
+    
+    # 4. Calculate current noise power and scale
+    current_noise_power = np.mean(noise ** 2)
+    scaling_factor = np.sqrt(total_desired_noise_power / current_noise_power)
+    
+    scaled_noise = noise * scaling_factor
+    noisy_signal = signal + scaled_noise
+    
     return noisy_signal
 
 ## ====================
