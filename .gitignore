@@ -1,10 +1,4 @@
 dev/external/*
 data/*
 results/*
-dev/nb71_s2g_eval_4.ipynb
-dev/nb71_s2g_eval_5.ipynb
-dev/nb71_s2g_eval_6.ipynb
-dev/nb72_analytical_version.ipynb
-dev/nb73_auv_test.ipynb
-dev/nb74_auv_test2.ipynb
 !.gitkeep     # optional if you want to commit an empty folder
