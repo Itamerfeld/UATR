@@ -51,10 +51,11 @@ print(f"Settings: height={height}, width={width}, font_size={font_size}")
 ## ====================
 
 class WelchDetector:
-    def __init__(self, fs, nperseg, overlap, window, dc, crop_freq, norm_size, default_distance=3):
+    def __init__(self, fs, nperseg, overlap=0.5, nfft=None, window='hanning', dc=20, crop_freq=None, norm_size=5, default_distance=3):
         self.fs = fs
         self.nperseg = nperseg
         self.overlap = overlap
+        self.nfft = nfft
         self.window = window
         self.dc = dc
         self.crop_freq = crop_freq
@@ -70,18 +71,23 @@ class WelchDetector:
         return is_detected, detections, (pxx, F)
     
     def get_feature_vector(self, rx):
-        F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
+        F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
         pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=self.norm_size)
         return pxx, F
+    
+    def set_nperseg(self, nperseg):
+        self.nperseg = nperseg
         
 class S2GDetector:
-    def __init__(self, fs, nperseg, overlap, window, dc, crop_freq, quantization_levels, mode="wasserstein", default_distance=2):
+    def __init__(self, fs, nperseg, overlap=0., nfft=None, window='hanning', dc=20, crop_freq=None, norm_size=9, quantization_levels=10, mode="wasserstein", default_distance=2):
         self.fs = fs
         self.nperseg = nperseg
         self.overlap = overlap
+        self.nfft = nfft
         self.window = window
         self.dc = dc
         self.crop_freq = crop_freq
+        self.norm_size = norm_size
         self.quantization_levels = quantization_levels
         self.mode = mode
         self.default_distance = default_distance
@@ -95,7 +101,7 @@ class S2GDetector:
         return is_detected, detections, (K, F)
     
     def get_feature_vector(self, rx):
-        F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
+        F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
         K = get_all_Ks(phasogram, F, n_levels=self.quantization_levels, mode=self.mode)
         if self.mode == "edge_count":
             K = 1 - K
@@ -104,9 +110,18 @@ class S2GDetector:
             # K = np.mean(K) - K
             K = K / np.mean(K)
             K = np.mean(K) - K
+            K[-1] = 0  # handle edge case where last value is unreliable (Nyquist frequency)
         if self.mode == "wasserstein":
-            K = (K - np.min(K)) / (np.max(K) - np.min(K))  # normalize to [0,1]
+            # K = (K - np.min(K)) / (np.max(K) - np.min(K))  # normalize to [0,1]
+            # K = rw_normalization(K, window_size=self.norm_size)
+            K = np.abs(cfar_normalization(K, window_size=self.norm_size, guard_size=2) - 1)
         return K, F
+    
+    def set_nperseg(self, nperseg):
+        self.nperseg = nperseg
+
+    def set_quantization_levels(self, quantization_levels):
+        self.quantization_levels = quantization_levels
 
 ## ====================
 ## S2G UTILITIES
@@ -280,6 +295,19 @@ def rw_normalization(x, window_size=17):
     ret[-window_size//2:] = ret[-window_size//2-1]
     return ret
 
+def cfar_normalization(x, window_size=17, guard_size=2):
+    if window_size % 2 == 0:
+        window_size += 1  # make it odd
+    normalization_kernel = np.ones((window_size,)) / (window_size - guard_size*2 - 1)
+    normalization_kernel[window_size // 2 - guard_size:window_size // 2 + guard_size + 1] = 0
+    smooth_x = signal.convolve(x, normalization_kernel, mode='same')
+    ret = x / (smooth_x + 1e-10)
+
+    # handle edge cases by replicating nearest valid value
+    ret[:window_size//2] = ret[window_size//2]
+    ret[-window_size//2:] = ret[-window_size//2-1]
+    return ret
+
 def rw_normalization2d(x, window_size=17):
     if window_size % 2 == 0:
         window_size += 1  # make it odd
@@ -289,15 +317,27 @@ def rw_normalization2d(x, window_size=17):
     ret = x / (smooth_x + 1e-10)
     return ret
 
-def calc_spectrogram(x, fs, nperseg, percent_overlap, window='hamming', remove_dc=None, crop_freq=None, logscale=True):
+def calc_spectrogram(x, fs, nperseg, percent_overlap, nfft=None, window='hamming', remove_dc=None, crop_freq=None, logscale=True):
     # prepare for PSD calculation
     noverlap = int(nperseg * percent_overlap)
     step = nperseg - noverlap
-    window_vals = getattr(np, window)(nperseg)
+    
+    if window == 'flattop':
+        window_vals = signal.windows.flattop(nperseg)
+    elif hasattr(np, window):
+        window_vals = getattr(np, window)(nperseg)
+    elif hasattr(signal.windows, window):
+        window_vals = signal.get_window(window, nperseg)
+    else:
+        raise ValueError(f"Window '{window}' not found in numpy or scipy.signal.windows")
+        
     window_power = np.sum(window_vals**2)
 
+    if nfft is None:
+        nfft = nperseg
+
     n_segments = (len(x) - noverlap) // step
-    f = np.fft.rfftfreq(nperseg, 1/fs)
+    f = np.fft.rfftfreq(nfft, 1/fs)
     t = np.arange(n_segments) * step / fs
     Sxx = np.zeros((n_segments, len(f)))
     Phase = np.zeros((n_segments, len(f)))
@@ -308,7 +348,7 @@ def calc_spectrogram(x, fs, nperseg, percent_overlap, window='hamming', remove_d
         if len(segment) < nperseg:
             break
         segment = segment * window_vals
-        spectrum = np.fft.rfft(segment)
+        spectrum = np.fft.rfft(segment, n=nfft)
         Sxx[i, :] = (np.abs(spectrum)**2) / (fs * window_power)
         Phase[i, :] = np.angle(spectrum)
 
