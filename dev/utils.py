@@ -50,7 +50,7 @@ print(f"Settings: height={height}, width={width}, font_size={font_size}")
 ## DETECTORS
 ## ====================
 
-class WelchDetector:
+class BestDetector:
     def __init__(self, fs, nperseg, overlap=0.5, nfft=None, window='hanning', dc=20, crop_freq=None, norm_size=5, default_distance=3):
         self.fs = fs
         self.nperseg = nperseg
@@ -64,9 +64,7 @@ class WelchDetector:
 
     def detect(self, rx, threshold):
         pxx, F = self.get_feature_vector(rx)
-        # TH = np.mean(pxx) + threshold * np.std(pxx)
-        TH = threshold
-        detections = find_peaks(pxx, height=TH, distance=self.default_distance)[0]
+        detections = find_peaks(pxx, height=threshold, distance=self.default_distance)[0]
         is_detected = len(detections) > 0
         return is_detected, detections, (pxx, F)
     
@@ -74,10 +72,8 @@ class WelchDetector:
         F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
         pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=self.norm_size)
         return pxx, F
-    
-    def set_nperseg(self, nperseg):
-        self.nperseg = nperseg
         
+
 class S2GDetector:
     def __init__(self, fs, nperseg, overlap=0., nfft=None, window='hanning', dc=20, crop_freq=None, norm_size=9, quantization_levels=10, mode="wasserstein", default_distance=2):
         self.fs = fs
@@ -94,34 +90,53 @@ class S2GDetector:
 
     def detect(self, rx, threshold):
         K, F = self.get_feature_vector(rx)
-        # TH = np.mean(K) + (2+threshold) * np.std(K)
-        TH = threshold
-        detections = find_peaks(K, height=TH, distance=self.default_distance)[0]
+        detections = find_peaks(K, height=threshold, distance=self.default_distance)[0]
         is_detected = len(detections) > 0
         return is_detected, detections, (K, F)
     
     def get_feature_vector(self, rx):
         F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
         K = get_all_Ks(phasogram, F, n_levels=self.quantization_levels, mode=self.mode)
+        # K = cfar_normalization(K, window_size=self.norm_size)
         if self.mode == "edge_count":
             K = 1 - K
         if self.mode == "laplacian":
-            # K = (K - np.min(K)) / (np.max(K) - np.min(K))  # normalize to [0,1]
-            # K = np.mean(K) - K
             K = K / np.mean(K)
-            K = np.mean(K) - K
-            K[-1] = 0  # handle edge case where last value is unreliable (Nyquist frequency)
+            K = 1 - K
         if self.mode == "wasserstein":
-            # K = (K - np.min(K)) / (np.max(K) - np.min(K))  # normalize to [0,1]
-            # K = rw_normalization(K, window_size=self.norm_size)
-            K = np.abs(cfar_normalization(K, window_size=self.norm_size, guard_size=2) - 1)
+            K = K / np.mean(K)
+            K = K - 1
         return K, F
-    
-    def set_nperseg(self, nperseg):
-        self.nperseg = nperseg
 
-    def set_quantization_levels(self, quantization_levels):
-        self.quantization_levels = quantization_levels
+class TalmonDetector:
+    def __init__(self, fs, nperseg, overlap=0.5, nfft=None, window='hanning', dc=20, crop_freq=None, norm_size=9, default_distance=3):
+        self.fs = fs
+        self.nperseg = nperseg
+        self.overlap = overlap
+        self.nfft = nfft
+        self.window = window
+        self.dc = dc
+        self.crop_freq = crop_freq
+        self.norm_size = norm_size
+        self.default_distance = default_distance
+
+    def detect(self, rx, threshold):
+        scores, F = self.get_feature_vector(rx)
+        scores = rw_normalization(scores, window_size=self.norm_size)
+        detections = find_peaks(scores, height=threshold, distance=self.default_distance)[0]
+        is_detected = len(detections) > 0
+        return is_detected, detections, (scores, F)
+    
+    def get_feature_vector(self, rx):
+        F, T, Sxx, _ = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
+        Sxx_odd = Sxx[:, 1::2]
+        Sxx_even = Sxx[:, ::2]
+
+        corr_scores = np.zeros((len(F)))
+        for i in range(len(F)):
+            n = min(Sxx_odd.shape[1], Sxx_even.shape[1])
+            corr_scores[i] = np.corrcoef(Sxx_odd[i, :n], Sxx_even[i, :n])[0][1]
+        return corr_scores, F
 
 ## ====================
 ## S2G UTILITIES
@@ -376,6 +391,7 @@ def calc_welch_from_spectrogram(Sxx, normalization_window_size=None):
     Pxx = np.mean(Sxx, axis=1)
     if normalization_window_size is not None:
         Pxx = rw_normalization(Pxx, window_size=normalization_window_size)
+        # Pxx = cfar_normalization(Pxx, window_size=normalization_window_size)
     Pxx = np.abs(Pxx - 1)
     return Pxx
 

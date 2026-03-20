@@ -2,3 +2,9 @@ dev/external/*
 data/*
 results/*
 !.gitkeep     # optional if you want to commit an empty folder
+
+.DS_Store
+**/.DS_Store
+__pycache__/
+*.py[cod]
+.vscode/
