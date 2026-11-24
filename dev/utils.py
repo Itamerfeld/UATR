@@ -16,7 +16,7 @@ from numpy import histogram2d
 
 from scipy import signal
 from scipy.fft import fft, fftfreq, fftshift
-from scipy.signal import find_peaks, butter, filtfilt, sosfiltfilt, welch
+from scipy.signal import find_peaks, butter, filtfilt, sosfiltfilt, welch, hilbert
 from scipy.ndimage import gaussian_filter
 from scipy.io import wavfile
 from scipy.stats import wasserstein_distance_nd
@@ -30,27 +30,30 @@ from sklearn.svm import SVC
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 
-# import utils as ut
-# %load_ext autoreload
-# %autoreload 2
-
-# do not show warnings
-warnings.filterwarnings("ignore")
-
-print("Imports complete.")
-
-# plotting parameters
-height = 800
-width = 1400
-font_size = 16
-
-print(f"Settings: height={height}, width={width}, font_size={font_size}")
+from check_circle_v2 import transition_matrix_circularity
 
 ## ====================
 ## DETECTORS
 ## ====================
 
-class BestDetector:
+class FrequencyDetector:
+    def detect(self, rx, threshold):
+        scores, F = self.get_feature_vector(rx)
+        detections = find_peaks(scores, height=threshold, distance=self.default_distance)[0]
+        is_detected = len(detections) > 0
+        return is_detected, detections, (scores, F)
+    
+    def get_feature_vector(self, rx):
+        pass
+    
+    def get_score_1fb(self, rx, f0):
+        scores, F = self.get_feature_vector(rx)
+        fix = np.where(F >= f0)[0][0]
+        score = scores[fix]
+        return score
+
+
+class WelchDetector:
     def __init__(self, fs, nperseg, overlap=0.5, nfft=None, window='hanning', dc=20, crop_freq=None, norm_size=5, default_distance=3):
         self.fs = fs
         self.nperseg = nperseg
@@ -72,6 +75,12 @@ class BestDetector:
         F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
         pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=self.norm_size)
         return pxx, F
+
+    def get_score_1fb(self, rx, f0):
+        F, T, Sxx, _ = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
+        fix = np.where(F >= f0)[0][0]
+        score = np.abs(np.mean(Sxx[fix, :]))
+        return score
         
 
 class S2GDetector:
@@ -97,16 +106,16 @@ class S2GDetector:
     def get_feature_vector(self, rx):
         F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
         K = get_all_Ks(phasogram, F, n_levels=self.quantization_levels, mode=self.mode)
-        # K = cfar_normalization(K, window_size=self.norm_size)
-        if self.mode == "edge_count":
-            K = 1 - K
-        if self.mode == "laplacian":
-            K = K / np.mean(K)
-            K = 1 - K
-        if self.mode == "wasserstein":
-            K = K / np.mean(K)
-            K = K - 1
         return K, F
+
+    def get_score_1fb(self, rx, f0):
+        F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
+        fix = np.where(F >= f0)[0][0]
+        phase = phasogram[fix, :]
+        transitions = get_s2g(phase, self.quantization_levels)
+        score = get_K(transitions, mode=self.mode)
+        return score
+
 
 class TalmonDetector:
     def __init__(self, fs, nperseg, overlap=0.5, nfft=None, window='hanning', dc=20, crop_freq=None, norm_size=9, default_distance=3):
@@ -128,15 +137,264 @@ class TalmonDetector:
         return is_detected, detections, (scores, F)
     
     def get_feature_vector(self, rx):
-        F, T, Sxx, _ = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
-        Sxx_odd = Sxx[:, 1::2]
-        Sxx_even = Sxx[:, ::2]
+        return correlation_score(rx, self.fs, self.nperseg, self.overlap, self.window, self.dc, self.crop_freq)
 
-        corr_scores = np.zeros((len(F)))
-        for i in range(len(F)):
-            n = min(Sxx_odd.shape[1], Sxx_even.shape[1])
-            corr_scores[i] = np.corrcoef(Sxx_odd[i, :n], Sxx_even[i, :n])[0][1]
-        return corr_scores, F
+    def get_score_1fb(self, rx, f0):
+        scores, F = self.get_feature_vector(rx)
+        fix = np.where(F >= f0)[0][0]
+        return scores[fix]
+
+
+class ClassicDetector:
+    def __init__(self, fs, nperseg, overlap=0.5, nfft=None, window='hanning', dc=20, crop_freq=None, norm_size=5, default_distance=3, mode='welch'):
+        self.fs = fs
+        self.nperseg = nperseg
+        self.overlap = overlap
+        self.nfft = nfft
+        self.window = window
+        self.dc = dc
+        self.crop_freq = crop_freq
+        self.norm_size = norm_size
+        self.default_distance = default_distance
+        self.mode = mode
+
+    def detect(self, rx, threshold):
+        scores, F = self.get_feature_vector(rx)
+        detections = find_peaks(scores, height=threshold, distance=self.default_distance)[0]
+        is_detected = len(detections) > 0
+        return is_detected, detections, (scores, F)
+    
+    def get_feature_vector(self, rx, mode=None):
+        if mode is None:
+            mode = self.mode
+        if mode == 'welch':
+            F, T, Sxx, phasogram = calc_spectrogram(rx, self.fs, nperseg=self.nperseg, percent_overlap=self.overlap, nfft=self.nfft, window=self.window, remove_dc=self.dc, crop_freq=self.crop_freq)
+            scores = calc_welch_from_spectrogram(Sxx, normalization_window_size=self.norm_size)
+        elif mode == 'correlation':
+            scores, F = correlation_score(rx, self.fs, self.nperseg, self.overlap, self.window, self.dc, self.crop_freq)
+        elif mode in ('demon_spectrum', 'demon'):
+            scores, F = demon_spectrum(rx, self.fs, self.dc, self.crop_freq)
+        elif mode in ('spectral_entropy', 'entropy'):
+            scores, F = spectral_entropy(rx, self.fs, self.nperseg, self.overlap, self.window, self.dc, self.crop_freq)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        scores = (scores - np.min(scores)) / np.std(scores) if np.std(scores) > 0 else scores
+
+        return scores, F
+
+    def get_score_1fb(self, rx, f0, mode='welch'):
+        scores, F = self.get_feature_vector(rx, mode=mode)
+        fix = np.where(F >= f0)[0][0]
+        score = scores[fix]
+        return score
+
+## ====================
+## FEATURE EXTRACTORS
+## ====================
+
+def s2g_score(signal, fs, nperseg, percent_overlap, window, remove_dc=None, crop_freq=None, quantization_levels=3, mode='wasserstein'):
+    ## TODO: implement this
+    pass
+
+def s2g_score_narrowband(signal, fs, nperseg, percent_overlap, window, target_freq, bandwidth, remove_dc=None, crop_freq=None, quantization_levels=3, mode='wasserstein', agg='max'):
+    ## TODO: implement this
+    pass
+
+def correlation_score(signal, fs, nperseg, percent_overlap, window, remove_dc=None, crop_freq=None):
+    # Use linear power: Pearson on (nearly constant) CW tone power demeans the tone away.
+    # Odd/even cross-energy keeps the DC power and peaks at stable tones.
+    F, T, Sxx, _ = calc_spectrogram(signal, fs, nperseg, percent_overlap, window=window,
+                                    remove_dc=remove_dc, crop_freq=crop_freq, logscale=False)
+    Sxx_odd = Sxx[:, 1::2]
+    Sxx_even = Sxx[:, ::2]
+    n = min(Sxx_odd.shape[1], Sxx_even.shape[1])
+    corr_scores = np.mean(Sxx_odd[:, :n] * Sxx_even[:, :n], axis=1)
+    return corr_scores, F
+
+def correlation_score_narrowband(signal, fs, nperseg, percent_overlap, window, target_freq, bandwidth, remove_dc=None, crop_freq=None, agg='max'):
+    values, freqs = correlation_score(signal, fs, nperseg, percent_overlap, window, remove_dc=remove_dc, crop_freq=crop_freq)
+    half_bw = bandwidth / 2
+    band_mask = (freqs >= target_freq - half_bw) & (freqs <= target_freq + half_bw)
+    if not np.any(band_mask):
+        nearest_ix = np.argmin(np.abs(freqs - target_freq))
+        band_mask[nearest_ix] = True
+    band_values = values[band_mask]
+    band_freqs = freqs[band_mask]
+
+    if agg == 'mean':
+        result = np.mean(band_values)
+    elif agg == 'max':
+        result = np.max(band_values)
+    elif agg == 'sum':
+        result = np.sum(band_values)
+
+    return result, band_values, band_freqs
+
+def demon_spectrum(signal, fs, remove_dc=None, crop_freq=None):
+    """
+    DEMON: Detection of Envelope Modulation on Noise
+    Returns envelope spectrum
+    """
+    analytic = hilbert(signal)
+    envelope = np.abs(analytic)
+
+    spectrum = np.fft.rfft(envelope)
+    freqs = np.fft.rfftfreq(len(envelope), d=1/fs)
+
+    if remove_dc is not None:
+        dc_ix = np.where(freqs > remove_dc)[0][0]
+        spectrum = spectrum[dc_ix:]
+        freqs = freqs[dc_ix:]
+
+    if crop_freq is not None:
+        crop_ix = np.where(freqs > crop_freq)[0][0]
+        spectrum = spectrum[:crop_ix]
+        freqs = freqs[:crop_ix]
+
+    return np.abs(spectrum), freqs
+
+def demon_spectrum_narrowband(signal, fs, target_freq, bandwidth,
+                              remove_dc=None, crop_freq=None, agg='max'):
+    values, freqs = demon_spectrum(signal, fs, remove_dc=remove_dc, crop_freq=crop_freq)
+
+    half_bw = bandwidth / 2
+    band_mask = (freqs >= target_freq - half_bw) & (freqs <= target_freq + half_bw)
+    if not np.any(band_mask):
+        nearest_ix = np.argmin(np.abs(freqs - target_freq))
+        band_mask[nearest_ix] = True
+    band_values = values[band_mask]
+    band_freqs = freqs[band_mask]
+
+    if agg == 'mean':
+        result = np.mean(band_values)
+    elif agg == 'max':
+        result = np.max(band_values)
+    elif agg == 'sum':
+        result = np.sum(band_values)
+    else:
+        raise ValueError(f"Unknown aggregation mode: {agg}")
+
+    return result, band_values, band_freqs
+
+def spectral_entropy(signal, fs, nperseg, percent_overlap, window, remove_dc=None, crop_freq=None):
+    # Must use linear power (default spectrogram is log-scaled). A stable tone has a
+    # more uniform temporal power distribution than bursty noise bins, so Shannon
+    # entropy over time peaks at the tone — do not negate.
+    _F, _T, _Sxx, _phasogram = calc_spectrogram(
+        signal, fs=fs, nperseg=nperseg, percent_overlap=percent_overlap, window=window,
+        remove_dc=remove_dc, crop_freq=crop_freq, logscale=False,
+    )
+
+    psd = np.maximum(_Sxx, 0.0)
+    psd_sum = np.sum(psd, axis=1, keepdims=True) + 1e-12
+    p = psd / psd_sum
+
+    entropy = -(p * np.log(p + 1e-12)).sum(axis=1)
+
+    return entropy, _F
+
+def spectral_entropy_narrowband(signal, fs, nperseg, percent_overlap, window,
+                                target_freq, bandwidth,
+                                remove_dc=None, crop_freq=None, agg='max'):
+    values, freqs = spectral_entropy(signal, fs, nperseg, percent_overlap, window,
+                                     remove_dc=remove_dc, crop_freq=crop_freq)
+
+    half_bw = bandwidth / 2
+    band_mask = (freqs >= target_freq - half_bw) & (freqs <= target_freq + half_bw)
+    if not np.any(band_mask):
+        nearest_ix = np.argmin(np.abs(freqs - target_freq))
+        band_mask[nearest_ix] = True
+    band_values = values[band_mask]
+    band_freqs = freqs[band_mask]
+
+    if agg == 'mean':
+        result = np.mean(band_values)
+    elif agg == 'max':
+        result = np.max(band_values)
+    elif agg == 'sum':
+        result = np.sum(band_values)
+    else:
+        raise ValueError(f"Unknown aggregation mode: {agg}")
+
+    return result, band_values, band_freqs
+
+def cepstrum(signal, fs, nperseg, percent_overlap, window, remove_dc=None, crop_freq=None, mode='power'):
+    if mode == 'real':
+        X = np.fft.fft(signal)
+        log_mag = np.log(np.abs(X) + 1e-12)  # small epsilon to avoid log(0)
+        cepstrum = np.real(np.fft.ifft(log_mag))
+
+    elif mode == 'power':
+        X = np.fft.fft(signal)
+        log_power = np.log(np.abs(X)**2 + 1e-12)
+        cepstrum = np.abs(np.fft.ifft(log_power))**2
+    else:
+        raise ValueError(f"Unknown cepstrum mode: {mode}")
+
+    freqs = np.fft.rfftfreq(len(signal), d=1/fs)
+
+    if remove_dc is not None:
+        dc_ix = np.where(freqs >= remove_dc)[0][0]
+        cepstrum = cepstrum[dc_ix:]
+        freqs = freqs[dc_ix:]
+
+    if crop_freq is not None:
+        crop_ix = np.where(freqs >= crop_freq)[0][0]
+        cepstrum = cepstrum[:crop_ix]
+        freqs = freqs[:crop_ix]
+
+    return cepstrum, freqs
+
+def cepstrum_narrowband(signal, fs, nperseg, percent_overlap, window,
+                        target_freq, bandwidth,
+                        remove_dc=None, crop_freq=None, mode='power', agg='max'):
+    values, freqs = cepstrum(signal, fs, nperseg, percent_overlap, window,
+                             remove_dc=remove_dc, crop_freq=crop_freq, mode=mode)
+
+    half_bw = bandwidth / 2
+    band_mask = (freqs >= target_freq - half_bw) & (freqs <= target_freq + half_bw)
+    if not np.any(band_mask):
+        nearest_ix = np.argmin(np.abs(freqs - target_freq))
+        band_mask[nearest_ix] = True
+    band_values = values[band_mask]
+    band_freqs = freqs[band_mask]
+
+    if agg == 'mean':
+        result = np.mean(band_values)
+    elif agg == 'max':
+        result = np.max(band_values)
+    elif agg == 'sum':
+        result = np.sum(band_values)
+    else:
+        raise ValueError(f"Unknown aggregation mode: {agg}")
+
+    return result, band_values, band_freqs
+
+## ====================
+## Plotting Utilities
+## ====================
+
+def plot_spectrogram_with_spectral_features(data, features, fs, nperseg, percent_overlap, window, remove_dc, crop_freq, show_mode='browser'):
+    """
+    assumes _data is a numpy array
+    features is a dictionary of dictionaries of numpy arrays: {feature_name: {values: numpy_array, freqs: numpy_array}}
+    """
+    _F, _T, _Sxx, _phasogram = calc_spectrogram(data, fs=fs, nperseg=nperseg, percent_overlap=percent_overlap, window=window, remove_dc=remove_dc, crop_freq=crop_freq)
+
+    n_featurs = len(features)
+
+    fig = make_subplots(rows=1, cols=n_featurs+1, shared_yaxes=True, column_titles=["spectrogram"] + list(features.keys()), column_widths=[0.7] + [0.1] * n_featurs)
+    fig.add_trace(go.Heatmap(z=_Sxx, x=_T, y=_F, colorscale='viridis', showlegend=False, showscale=False), row=1, col=1)
+    
+    for i, feature in enumerate(features):
+        _x = features[feature]['values']
+        _y = features[feature]['freqs']
+        fig.add_trace(go.Scatter(x=_x, y=_y, marker_color='blue', showlegend=False), row=1, col=i+2)
+
+    fig.update_xaxes(title_text="Time (s)", row=1, col=1)
+    fig.update_yaxes(title_text="Frequency (Hz)", row=1, col=1)
+    fig.show(renderer=show_mode)
 
 ## ====================
 ## S2G UTILITIES
@@ -146,8 +404,9 @@ def normalize_data(x):
     x = x / 2  # this is necessary to avoid overflow in some cases due to super large values (probably a bug somewhere else)
     xmin = np.min(x)
     xmax = np.max(x)
-    normalized_data = (x - xmin) / (xmax - xmin) if xmax != xmin else 0
-    return normalized_data
+    if xmax == xmin:
+        return np.zeros_like(x, dtype=float)
+    return (x - xmin) / (xmax - xmin)
 
 def quantize_data(x, n_levels):
     x_quantized = np.floor(x * n_levels).astype(int)
@@ -166,6 +425,14 @@ def get_s2g(x, n_levels):
     transitions = get_s2g_transition_matrix(x, n_levels)
     return transitions
 
+def get_s2g_binary(x, n_levels):
+    x = normalize_data(x)
+    x = quantize_data(x, n_levels)
+    transitions = get_s2g_transition_matrix(x, n_levels).astype(float)
+    # Compare probabilities to uniform joint mass (counts vs 1/n_levels was a type mismatch)
+    probs = transitions / (transitions.sum() + 1e-12)
+    return np.where(probs > 1.0 / (n_levels ** 2), 1, 0)
+
 def get_s2g_edges(x_quantized):
     edges = []
     for i in range(1, len(x_quantized)):
@@ -173,10 +440,33 @@ def get_s2g_edges(x_quantized):
             edges.append((x_quantized[i-1], x_quantized[i]))
     return edges
 
+def get_s2g_edges_binary(x_quantized, n_levels):
+    nodes = list(range(n_levels))
+    edges = []
+    # x_quantized is already quantized; build counts directly (do not re-normalize/quantize)
+    transitions = get_s2g_transition_matrix(x_quantized, n_levels).astype(float)
+    probs = transitions / (transitions.sum() + 1e-12)
+    binary = np.where(probs > 1.0 / (n_levels ** 2), 1, 0)
+    for i in range(binary.shape[0]):
+        for j in range(binary.shape[1]):
+            if binary[i, j] == 1:
+                edges.append((i, j))
+    return edges, nodes
+
+def get_s2g_graph_binary(x, n_levels):
+    x = normalize_data(x)
+    x = quantize_data(x, n_levels)
+    edges, nodes = get_s2g_edges_binary(x, n_levels)
+    G = nx.DiGraph()
+    G.add_nodes_from(nodes)
+    G.add_edges_from(edges)
+    return G
+
 def get_s2g_graph(x, n_levels):
     x = normalize_data(x)
     x = quantize_data(x, n_levels)
-    nodes = np.unique(x)
+    # nodes = np.unique(x)
+    nodes = list(range(n_levels))
     edges = get_s2g_edges(x)
     G = nx.DiGraph()
     G.add_nodes_from(nodes)
@@ -189,7 +479,10 @@ def get_K(transition_matrix, mode='wasserstein', uniform_M=None):
             uniform_dist = uniform_M
         else:
             uniform_dist = np.ones(transition_matrix.shape) / transition_matrix.size
-        K = wasserstein_distance_nd(transition_matrix, uniform_dist)
+        # Transition counts must be a probability mass to compare against uniform_dist
+        tm = np.asarray(transition_matrix, dtype=float)
+        tm = tm / (tm.sum() + 1e-12)
+        K = wasserstein_distance_nd(tm, uniform_dist)
     elif mode == 'edge_count':    
         edge_count = np.count_nonzero(transition_matrix)
         K = edge_count / transition_matrix.size
@@ -199,8 +492,14 @@ def get_K(transition_matrix, mode='wasserstein', uniform_M=None):
         eigenvalues = LA.eigvals(L)  # only eigenvalues; avoids mixed tuple
         eigenvalues = np.real(eigenvalues)
         eigenvalues = np.sort(eigenvalues)
+        # remove trivial eigenvalues
+        eigenvalues = eigenvalues[eigenvalues > 1e-6]
+        K = eigenvalues[0] if eigenvalues.size > 0 else 0
         # use Fiedler value when available; fallback to first eigenvalue for 1x1
-        K = eigenvalues[1] if eigenvalues.size > 1 else eigenvalues[0]
+        # K = eigenvalues[1] if eigenvalues.size > 1 else eigenvalues[0]
+    elif mode == 'circularity':
+        K = transition_matrix_circularity(transition_matrix)
+        K = K.score
     elif mode == 'all':
         K1 = get_K(transition_matrix, mode='wasserstein')
         K2 = get_K(transition_matrix, mode='edge_count')
@@ -221,7 +520,19 @@ def get_all_Ks(phase_matrix, frequencies, n_levels, mode='wasserstein'):
         transition_matrix = get_s2g(x, n_levels=n_levels)
         K = get_K(transition_matrix, mode=mode, uniform_M=uniform_M)
         Ks.append(K)
-    Ks = np.array(Ks[:-1])  # exclude last frequency if it's the Nyquist frequency (which may be less reliable)
+    Ks = np.asarray(Ks, dtype=float)
+
+    if mode == "edge_count":
+        # Tonal phase graphs are more concentrated (fewer edges) → invert
+        Ks = 1.0 - Ks
+    elif mode == "laplacian":
+        std = np.std(Ks)
+        Ks = (np.max(Ks) - Ks) / std if std > 0 else Ks
+    elif mode == "wasserstein":
+        std = np.std(Ks)
+        Ks = (Ks - np.min(Ks)) / std if std > 0 else Ks
+    elif mode == "circularity":
+        pass
     return Ks
 
 ## ====================
@@ -238,29 +549,14 @@ def pink_noise(N):
     return pink[:N]
 
 def white_noise(N):
-    return np.random.rand(N)
+    # Zero-mean Gaussian. np.random.rand (Uniform[0,1]) adds a DC offset that
+    # spuriously amplitude-modulates CW tones and breaks DEMON / SNR scaling.
+    return np.random.randn(N)
 
 def simulate_raw_signal(f0, fs, duration):
     t = np.linspace(0, duration, int(fs * duration), endpoint=False)
     sig = 0.5 * np.sin(2 * np.pi * f0 * t)
     return sig
-
-# def add_noise_to_signal(signal, snr_db, noise_type='white'):
-
-#     if noise_type == 'white':
-#         noise = white_noise(len(signal))
-#     elif noise_type == 'pink':
-#         noise = pink_noise(len(signal))
-#     else:
-#         raise ValueError(f"Unknown noise type: {noise_type}")
-    
-#     signal_power = np.mean(signal ** 2)
-#     noise_power = np.mean(noise ** 2)
-#     desired_noise_power = signal_power / (10 ** (snr_db / 10))
-#     scaling_factor = np.sqrt(desired_noise_power / noise_power)
-#     noise = noise * scaling_factor
-#     noisy_signal = signal + noise
-#     return noisy_signal
 
 def add_noise_to_signal(signal, snr_db, fs, signal_bw, noise_type='white'):
     """
@@ -1012,7 +1308,7 @@ def slice_signal(data, annotations, fs, slice_duration=1.0, overlap=0.5, annotat
 
 def load_ds_samples(with_print=True, target_fs=None):
     # dpv1 - croatia - speed 1
-    data_file = "../data/dpv1_1m.wav"
+    data_file = "../data/ds2/pos/dpv1_1m.wav"
     # dpv1_fs, dpv1_data = wavfile.read(data_file)
     dpv1_data, dpv1_fs = librosa.load(data_file, sr=target_fs)
     dpv1_slice = dpv1_data[int(35*dpv1_fs):int(45*dpv1_fs)]
@@ -1023,13 +1319,13 @@ def load_ds_samples(with_print=True, target_fs=None):
     # dpv1_2_slice = dpv1_2_data[int(35*dpv1_2_fs):int(45*dpv1_2_fs)]
 
     # dpv2 - haifa
-    data_file = "../data/dpv2_1m.wav"
+    data_file = "../data/ds2/pos/dpv2_1m.wav"
     # dpv2_fs, dpv2_data = wavfile.read(data_file)
     dpv2_data, dpv2_fs = librosa.load(data_file, sr=target_fs)
     dpv2_slice = dpv2_data[int(15*dpv2_fs):int(25*dpv2_fs)]
 
     # croatia boat noise
-    data_file = "../data/croatia_boat_2.wav"
+    data_file = "../data/ds2/pos/croatia_boat_2.wav"
     # croatia_boat_fs, croatia_boat_data = wavfile.read(data_file)
     croatia_boat_data, croatia_boat_fs = librosa.load(data_file, sr=target_fs)
     croatia_boat_slice = croatia_boat_data[int(5*croatia_boat_fs):int(15*croatia_boat_fs)]
@@ -1045,7 +1341,7 @@ def load_ds_samples(with_print=True, target_fs=None):
     # large_ship_slice = large_ship_data[int(5*large_ship_fs):int(15*large_ship_fs)]
 
     # BG noise
-    data_file = "../data/bg_noise_1m.wav"
+    data_file = "../data/ds2/neg/bg_noise_1m.wav"
     # bg_fs, bg_data = wavfile.read(data_file)
     bg_data, bg_fs = librosa.load(data_file, sr=target_fs)
     bg_slice = bg_data[int(5*bg_fs):int(15*bg_fs)]
@@ -1117,7 +1413,7 @@ def explore_data(name_list, fs_dict, data_dict, fft_nperseg=32000, percent_overl
     for i, name in enumerate(name_list, start=1):
         fs = fs_dict[name]
         data = data_dict[name]
-        F, T, Sxx, _ = calc_spectrogram(data, fs, fft_nperseg, percent_overlap, window, remove_dc, crop_freq)
+        F, T, Sxx, _ = calc_spectrogram(data, fs, fft_nperseg, percent_overlap, window=window, remove_dc=remove_dc, crop_freq=crop_freq)
         pxx = calc_welch_from_spectrogram(Sxx, normalization_window_size=9) - 1
         peaks = find_peaks(pxx, height=np.average(pxx) + detection_threshold * np.std(pxx))[0][1:]  # ignore DC peak
         all_peaks[name] = peaks
